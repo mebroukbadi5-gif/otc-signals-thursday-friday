@@ -76,15 +76,26 @@ OUTPUT_JSON = OUTPUT_DIR / f"instruments_{RUN_TS}.json"
 OUTPUT_TXT = OUTPUT_DIR / f"instruments_{RUN_TS}.txt"
 
 # How long to wait for the binary response after sending instruments/get.
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 60
 
 # Minimum binary frame size to consider as a candidate instruments response.
 # Smaller frames are usually pings / acks and are ignored.
-MIN_BINARY_SIZE = 512
+MIN_BINARY_SIZE = 128
 
 # After successful auth, the server may auto-push the instruments list.
 # Wait this many seconds for an auto-push before sending our own request.
-AUTO_PUSH_WAIT_SECONDS = 3.0
+AUTO_PUSH_WAIT_SECONDS = 5.0
+
+# DEBUG: when True, every WS message (text + binary) is logged with size,
+# first 16 bytes (hex for binary), and first 200 chars (text). This helps
+# diagnose protocol issues without Wireshark.
+DEBUG_WS_TRAFFIC = True
+
+# DEBUG: how many hex bytes to show for binary frames.
+DEBUG_BINARY_PREVIEW_BYTES = 32
+
+# DEBUG: how many chars to show for text frames.
+DEBUG_TEXT_PREVIEW_CHARS = 200
 
 
 # ============================================================================
@@ -115,7 +126,11 @@ class InstrumentsListFetcher:
         self._patch_message_handler()
 
     def _patch_message_handler(self) -> None:
-        """Replace WebsocketClient.on_message with our interceptor."""
+        """Replace WebsocketClient.on_message with our interceptor.
+
+        Also patches on_open, on_close, on_error to log lifecycle events
+        for diagnostic purposes (these wrappers chain to the originals).
+        """
         api = self.client.api
         if api is None:
             raise RuntimeError("Quotex API is not initialized")
@@ -123,12 +138,82 @@ class InstrumentsListFetcher:
         if ws_client is None:
             raise RuntimeError("WebSocket client is not initialized")
         self._ws_client = ws_client
+
+        # Save originals
         self._original_on_message = ws_client.on_message
+        self._original_on_open = getattr(ws_client, "on_open", None)
+        self._original_on_close = getattr(ws_client, "on_close", None)
+        self._original_on_error = getattr(ws_client, "on_error", None)
+
+        # Install interceptor
         ws_client.on_message = self._on_message_interceptor
+
+        # Wrap lifecycle hooks for diagnostics
+        def open_wrapper(wss):
+            logmsg("[ws-lifecycle] on_open fired — WebSocket connected")
+            if self._original_on_open is not None:
+                try:
+                    self._original_on_open(wss)
+                except Exception as e:
+                    logmsg(f"[ws-lifecycle] original on_open raised: {e}")
+
+        def close_wrapper(wss, code=None, msg=None):
+            logmsg(f"[ws-lifecycle] on_close fired — code={code} msg={msg!r}")
+            if self._original_on_close is not None:
+                try:
+                    self._original_on_close(wss, code, msg)
+                except Exception as e:
+                    logmsg(f"[ws-lifecycle] original on_close raised: {e}")
+
+        def error_wrapper(wss, error):
+            logmsg(f"[ws-lifecycle] on_error fired — {error}")
+            if self._original_on_error is not None:
+                try:
+                    self._original_on_error(wss, error)
+                except Exception as e:
+                    logmsg(f"[ws-lifecycle] original on_error raised: {e}")
+
+        ws_client.on_open = open_wrapper
+        ws_client.on_close = close_wrapper
+        ws_client.on_error = error_wrapper
+
         logmsg("[instruments] interceptor installed on WebsocketClient.on_message")
+        logmsg("[instruments] lifecycle hooks installed (on_open/on_close/on_error)")
 
     def _on_message_interceptor(self, wss, msg) -> None:
-        """Intercept both text and binary frames."""
+        """Intercept both text and binary frames.
+
+        With DEBUG_WS_TRAFFIC enabled, every frame is logged:
+          - text frames: first DEBUG_TEXT_PREVIEW_CHARS chars
+          - binary frames: size + first DEBUG_BINARY_PREVIEW_BYTES hex bytes
+        """
+        # First: debug-log every frame.
+        if DEBUG_WS_TRAFFIC:
+            try:
+                if isinstance(msg, (bytes, bytearray)):
+                    raw = bytes(msg)
+                    preview_hex = raw[:DEBUG_BINARY_PREVIEW_BYTES].hex(' ')
+                    # Also try to decode first 80 chars as UTF-8 (after 0x04 strip)
+                    utf8_preview = ""
+                    if len(raw) > 0:
+                        offset = 1 if raw[0] == 0x04 else 0
+                        try:
+                            utf8_preview = raw[offset:offset + 80].decode('utf-8', errors='replace')
+                        except Exception:
+                            pass
+                    logmsg(
+                        f"[ws-debug] BINARY frame: {len(raw):,} bytes | "
+                        f"hex[0:{DEBUG_BINARY_PREVIEW_BYTES}]: {preview_hex} | "
+                        f"utf8(after 0x04 strip): {utf8_preview!r}"
+                    )
+                else:
+                    text = msg if isinstance(msg, str) else msg.decode("utf-8", errors="ignore")
+                    preview = text[:DEBUG_TEXT_PREVIEW_CHARS]
+                    truncated = "…" if len(text) > DEBUG_TEXT_PREVIEW_CHARS else ""
+                    logmsg(f"[ws-debug] TEXT   frame: {len(text):,} chars | {preview!r}{truncated}")
+            except Exception as e:
+                logmsg(f"[ws-debug] preview error: {e}")
+
         # First: handle binary frames (these are what we actually want).
         if isinstance(msg, (bytes, bytearray)):
             try:
@@ -268,19 +353,30 @@ class InstrumentsListFetcher:
         """Send the instruments/get request and wait for the binary response.
 
         Uses `42["instruments/get"]` (the correct client request format
-        confirmed by the working Node.js implementation). The server
-        responds with:
-          1. `451-["instruments/list",{...}]` text announcement
-          2. Binary frame containing the JSON instruments array
+        confirmed by the working Node.js implementation). To be robust
+        against silent drops, the request is sent multiple times with
+        a short delay between sends.
         """
         api = self.client.api
-        try:
-            api.send_websocket_request('42["instruments/get"]', no_force_send=False)
-            logmsg('[instruments] sent 42["instruments/get"]')
-        except Exception as e:
-            logmsg(f"[instruments] failed to send request: {e}")
-            return None
+        # Send the request multiple times. The Quotex server may silently
+        # drop a single request if it arrives too soon after auth, or if
+        # the WebSocket is in a transitional state.
+        requests_to_send = [
+            '42["instruments/get"]',
+            '42["instruments/get"]',
+            '42["instruments/get"]',
+        ]
+        logmsg(f"[instruments] sending {len(requests_to_send)} instruments/get requests...")
+        for i, req in enumerate(requests_to_send, 1):
+            try:
+                api.send_websocket_request(req, no_force_send=False)
+                logmsg(f"[instruments] sent request {i}/{len(requests_to_send)}: {req}")
+            except Exception as e:
+                logmsg(f"[instruments] failed to send request {i}: {e}")
+            if i < len(requests_to_send):
+                await asyncio.sleep(1.5)
 
+        logmsg(f"[instruments] waiting up to {timeout}s for binary response...")
         try:
             await asyncio.wait_for(self.received_event.wait(), timeout=timeout)
             return self.instruments_data
@@ -289,14 +385,20 @@ class InstrumentsListFetcher:
             return None
 
     def restore(self) -> None:
-        """Restore the original on_message handler."""
+        """Restore the original on_message/on_open/on_close/on_error handlers."""
         try:
             if (
                 self._ws_client is not None
                 and self._original_on_message is not None
             ):
                 self._ws_client.on_message = self._original_on_message
-                logmsg("[instruments] original handler restored")
+                if self._original_on_open is not None:
+                    self._ws_client.on_open = self._original_on_open
+                if self._original_on_close is not None:
+                    self._ws_client.on_close = self._original_on_close
+                if self._original_on_error is not None:
+                    self._ws_client.on_error = self._original_on_error
+                logmsg("[instruments] original handlers restored")
         except Exception:
             pass
 
@@ -467,6 +569,23 @@ async def main_async() -> None:
         except Exception as e:
             print(f"{Colors.RED}Failed to install interceptor: {e}{Colors.RESET}")
             return
+
+        # Diagnose connection state before waiting.
+        api = client.api
+        ws_alive = (
+            api is not None
+            and getattr(api, "websocket_client", None) is not None
+            and getattr(api.websocket_client, "wss", None) is not None
+        )
+        ws_connected = getattr(api.state, "check_websocket_if_connect", 0) if api else 0
+        auth_accepted = getattr(api.state, "check_accepted_connection", False) if api else False
+        logmsg(f"[diagnostic] api present: {api is not None}")
+        logmsg(f"[diagnostic] websocket_client.wss present: {ws_alive}")
+        logmsg(f"[diagnostic] check_websocket_if_connect: {ws_connected}")
+        logmsg(f"[diagnostic] check_accepted_connection: {auth_accepted}")
+        if not ws_alive or not ws_connected or not auth_accepted:
+            logmsg(f"{Colors.RED}[diagnostic] WebSocket state is NOT healthy — "
+                   f"server may not respond to any request.{Colors.RESET}")
 
         # Brief window for the auto-push (sent during on_open) to arrive.
         # If the auto-push arrives within this window, we're done.
