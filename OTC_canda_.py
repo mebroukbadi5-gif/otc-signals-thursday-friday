@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CANDAL — Quotex Candle Fetcher (نسخة مبسّطة)
+CANDAL — Quotex Candle Fetcher (نسخة مبسّطة + آلية عدم النوم)
 ======================================================
 هذه نسخة معدّلة من BOT.py تُركّز على جلب الشموع من Quotex وحفظها كـ JSON.
 
-التغييرات الرئيسية:
-  - تم تحديث النطاق الأساسي إلى quotex.com
-  - تم نزع جزء MT4 بالكامل (Writer, .hst, MT4 sync engine, dashboard اللحظي).
-  - تم نزع حلقات keepalive/health/auto_reconnect/streaming التي تُبقي البوت حياً للأبد.
-  - أصبح البوت تفاعلياً: المستخدم يُدخل اسم العملة + عدد الأيام + الفريم (دقائق).
-  - يُحفظ الإيميل وكلمة المرور في credentials.json لإعادة الاستخدام.
-  - يحفظ الشموع في candles_data/{asset}_{timeframe}m_{days}d_{random}.json
-  - بعد كل جلب، ينتظر Enter للجلب التالي أو الخروج.
-  - لا يُضاف _otc تلقائياً: يُستخدم الاسم كما كُتب (XAUUSD أو XAUUSD_otc).
-  - ملف JSON منسّق: كل شمعة في سطر واحد مع تاريخ مقروء (UTC).
+الميزات (الإصدار الحالي):
+  - النطاق الأساسي: quotex.com (تم تحديثه من qxbroker.com).
+  - آلية "عدم النوم": keepalive_loop (ping كل 5s) + auto_reconnect_loop
+    (مراقبة الاتصال كل 10s وإعادة بنائه تلقائياً عند الفقد).
+  - بعد تسجيل الدخول يطلب من المستخدم اختيار أحد الخيارين:
+      (1) إدخال اسم عملة يدوياً (جلب فردي).
+      (2) جلب كل العملات الـ13 OTC تلقائياً بتتابع (يدخل المستخدم فقط
+          عدد الأيام + الفريم، ثم يبدأ الجلب التسلسلي تلقائياً).
+  - حفظ الشموع في مجلد جديد بِطابع زمني لكل عملية تشغيل:
+        candles_otc_data/<YYYYMMDD_HHMMSS>/
+    بحيث لا تختلط ببيانات سابقة.
+  - بيانات الدخول تُحفظ في credentials.json لإعادة الاستخدام.
+  - كل شمعة في سطر منفصل مع تاريخ مقروء (UTC).
 
 النواة المثبتة (من BOT.py الأصلي):
   - إعداد SSL + logging
@@ -1088,8 +1091,28 @@ class Quotex:
 # SECTION 8: CONSTANTS & CONFIG (جديد)
 # ==============================================================================
 CREDENTIALS_FILE = Path("credentials.json")
-CANDLES_DIR = Path("candles_data")
-CANDLES_DIR.mkdir(exist_ok=True)
+
+# كل عملية تشغيل تنشئ مجلد حفظ جديد بِطابع زمني حتى لا تختلط ببيانات سابقة.
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+CANDLES_DIR = Path("candles_otc_data") / RUN_TIMESTAMP
+CANDLES_DIR.mkdir(parents=True, exist_ok=True)
+
+# قائمة العملات الـ13 (OTC) — تُجلب تلقائياً عند اختيار الخيار 2 بعد تسجيل الدخول.
+OTC_ASSETS = [
+    "BRLUSD_otc",   # Brazil
+    "USDARS_otc",   # Argentina
+    "USDBDT_otc",   # Bangladesh
+    "USDCOP_otc",   # Colombia
+    "USDDZD_otc",   # Algeria
+    "USDEGP_otc",   # Egypt
+    "USDIDR_otc",   # Indonesia
+    "USDINR_otc",   # India
+    "USDMXN_otc",   # Mexico
+    "USDNGN_otc",   # Nigeria
+    "USDPHP_otc",   # Philippines
+    "USDPKR_otc",   # Pakistan
+    "USDZAR_otc",   # South Africa
+]
 
 # إعدادات الجلب — متوازي 5 workers (السرعة الأصلية ~4s لكل 1000 شمعة)
 FETCH_MAX_WORKERS = 5
@@ -1099,6 +1122,9 @@ MAX_FETCH_RETRIES = 5
 RETRY_BACKOFF_BASE = 2
 RETRY_BACKOFF_MAX = 15
 KEEPALIVE_INTERVAL = 5         # ping كل 5 ثوانٍ للحفاظ على الاتصال بين عمليات الجلب
+RECONNECT_CHECK_INTERVAL = 10  # فحص حالة الاتصال كل 10 ثوانٍ
+MAX_RECONNECT_ATTEMPTS = 5     # عدد محاولات إعادة الاتصال قبل الاستسلام
+RECONNECT_BACKOFF_BASE = 3     # ثانية بين المحاولات (يتضاعف)
 
 # أدوات التسجيل
 LOG_FILE = Path("candal.log")
@@ -1329,6 +1355,106 @@ async def keepalive_loop(client: Quotex, stop_event: asyncio.Event):
             pass  # انتهى المحدّد = أرسل ping التالي
 
 
+# ------------------------------------------------------------------------------
+# آلية "عدم النوم" (مستوحاة من الكود الضخم wedsoket_.py)
+# ------------------------------------------------------------------------------
+# مشترك بين keepalive_loop و auto_reconnect_loop لتجديد كائن Quotex عند الفقد.
+# يتم تحديثه عبر attribute set بدلاً من closure لتفادي مشاكل الـ late binding.
+class _ClientHolder:
+    """حاوية بسيطة تتيح لـ auto_reconnect استبدال كائن Quotex برمجياً."""
+    def __init__(self, client: Optional[Quotex]):
+        self.client = client
+        self.email: Optional[str] = None
+        self.password: Optional[str] = None
+        self.proxies: Optional[str] = None
+        self.lock = asyncio.Lock()
+
+
+def _is_connection_alive(client: Optional[Quotex]) -> bool:
+    """فحص سريع: هل اتصال Quotex ما زال نشطاً؟
+    يعيد False بأمان لأي كائن لا يحتوي على api أو state."""
+    if client is None:
+        return False
+    try:
+        api = getattr(client, "api", None)
+        if api is None:
+            return False
+        state = getattr(api, "state", None)
+        if state is None:
+            return False
+        return bool(getattr(state, "check_accepted_connection", False))
+    except Exception:
+        return False
+
+
+async def auto_reconnect_loop(holder: _ClientHolder, stop_event: asyncio.Event,
+                              on_reconnect=None) -> None:
+    """راقب حالة الاتصال كل RECONNECT_CHECK_INTERVAL ثانية. عند الفقد،
+    حاول إعادة الاتصال تلقائياً حتى MAX_RECONNECT_ATTEMPTS محاولة.
+
+    - لا يوقف البرنامج أبداً ما لم يُضبط stop_event.
+    - يستبدل holder.client بكائن Quotex جديد عند نجاح إعادة الاتصال.
+    - يستدعي on_reconnect(new_client) إن وُجدت (لإعلام الـ fetcher باستخدام الكائن الجديد).
+    """
+    while not stop_event.is_set():
+        try:
+            alive = _is_connection_alive(holder.client)
+            if not alive:
+                logmsg(f"{Colors.YELLOW}[reconnect] connection lost, attempting reconnect...{Colors.RESET}")
+                backoff = RECONNECT_BACKOFF_BASE
+                for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+                    if stop_event.is_set():
+                        return
+                    try:
+                        new_client = Quotex(
+                            email=holder.email,
+                            password=holder.password,
+                            host="quotex.com",
+                            lang="en",
+                            proxies=holder.proxies,
+                        )
+                        check, reason = await new_client.connect()
+                        if check:
+                            try:
+                                await new_client.change_account("PRACTICE")
+                                await asyncio.sleep(0.5)
+                            except Exception:
+                                pass
+                            async with holder.lock:
+                                # أغلق القديم بهدوء قبل الاستبدال
+                                try:
+                                    if holder.client:
+                                        await holder.client.close()
+                                except Exception:
+                                    pass
+                                holder.client = new_client
+                            logmsg(f"{Colors.GREEN}[reconnect] reconnect successful on attempt {attempt}{Colors.RESET}")
+                            if on_reconnect:
+                                try:
+                                    on_reconnect(new_client)
+                                except Exception as cb_err:
+                                    logmsg(f"[reconnect] on_reconnect callback raised: {cb_err}")
+                            break
+                        else:
+                            err = str(reason) if reason else "Unknown"
+                            logmsg(f"[reconnect] attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} failed: {err}")
+                    except Exception as e:
+                        logmsg(f"[reconnect] attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} raised: {e}")
+                    if attempt < MAX_RECONNECT_ATTEMPTS:
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 30)
+                else:
+                    logmsg(f"{Colors.RED}[reconnect] all {MAX_RECONNECT_ATTEMPTS} attempts failed; "
+                           f"will retry in {RECONNECT_CHECK_INTERVAL}s.{Colors.RESET}")
+        except Exception as e:
+            log_exception("auto_reconnect_loop", e)
+        # انتظار قابل للإيقاف
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=RECONNECT_CHECK_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def connect_quotex(email: str, password: str, max_attempts: int = 3,
                          proxies: Optional[str] = None) -> Optional[Quotex]:
     """يتصل بـ Quotex ويعيد كائن Quotex. يُعيد None عند الفشل.
@@ -1540,9 +1666,12 @@ def print_banner():
     print(f"{Colors.BOLD}  CANDAL - Quotex Candle Fetcher{Colors.RESET}")
     print(f"{Colors.BOLD}  Simplified version: fetch candles and save as JSON{Colors.RESET}")
     print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
-    print(f"{Colors.YELLOW}  Save folder: {CANDLES_DIR.absolute()}{Colors.RESET}")
-    print(f"{Colors.YELLOW}  Speed:       {FETCH_MAX_WORKERS} parallel workers{Colors.RESET}")
-    print(f"{Colors.YELLOW}  Timeframes:  1, 5, 15, 30, 60 (minutes){Colors.RESET}")
+    print(f"{Colors.YELLOW}  Host:         quotex.com (auto-reconnect + keepalive){Colors.RESET}")
+    print(f"{Colors.YELLOW}  Output dir:   {CANDLES_DIR.absolute()}{Colors.RESET}")
+    print(f"{Colors.YELLOW}  Speed:        {FETCH_MAX_WORKERS} parallel workers{Colors.RESET}")
+    print(f"{Colors.YELLOW}  Timeframes:   1, 5, 15, 30, 60 (minutes){Colors.RESET}")
+    print(f"{Colors.YELLOW}  Mode 1:       single asset fetch (manual){Colors.RESET}")
+    print(f"{Colors.YELLOW}  Mode 2:       batch fetch all 13 OTC pairs{Colors.RESET}")
     print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
 
 
@@ -1612,6 +1741,8 @@ async def prompt_timeframe() -> Optional[int]:
 
 async def main_async():
     print_banner()
+    print(f"{Colors.CYAN}  Output folder for this run:{Colors.RESET}")
+    print(f"  {Colors.YELLOW}{CANDLES_DIR.absolute()}{Colors.RESET}\n")
 
     # ===== Purge any stale Quotex session so we always log in fresh =====
     purge_old_session()
@@ -1646,78 +1777,171 @@ async def main_async():
     save_credentials(email, password)
     print(f"{Colors.GREEN}Credentials saved to {CREDENTIALS_FILE.name}{Colors.RESET}\n")
 
-    # ===== Start keepalive in the background =====
-    stop_keepalive = asyncio.Event()
-    keepalive_task = asyncio.create_task(keepalive_loop(client, stop_keepalive))
+    # ===== آلية "عدم النوم": keepalive + auto_reconnect في الخلفية =====
+    # الحاوية تتيح لـ auto_reconnect استبدال كائن client عند فقد الاتصال.
+    holder = _ClientHolder(client)
+    holder.email = email
+    holder.password = password
+    holder.proxies = None
+
+    # إشارة الـ fetcher النشط حتى يستخدم الكائن المُحدّث بعد إعادة الاتصال.
+    active_client_ref = {"client": client}
+
+    def on_reconnect(new_client):
+        active_client_ref["client"] = new_client
+        logmsg("[fetcher] active client updated after reconnect")
+
+    stop_bg = asyncio.Event()
+    keepalive_task = asyncio.create_task(keepalive_loop(client, stop_bg))
+    reconnect_task = asyncio.create_task(
+        auto_reconnect_loop(holder, stop_bg, on_reconnect=on_reconnect)
+    )
 
     try:
-        fetch_count = 0
         while True:
-            print(f"\n{Colors.CYAN}{'-'*60}{Colors.RESET}")
-            print(f"{Colors.BOLD}  New fetch request{Colors.RESET}")
-            print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
-
-            asset = await prompt_asset()
-            if asset is None:
-                print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
-                break
-
-            days = await prompt_days()
-            if days is None:
-                print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
-                break
-
-            timeframe = await prompt_timeframe()
-            if timeframe is None:
-                print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
-                break
-
-            # Summary
-            print(f"\n{Colors.CYAN}Summary:{Colors.RESET}")
-            print(f"  Asset:     {Colors.BOLD}{pretty_asset(asset, timeframe)}{Colors.RESET}")
-            print(f"  Symbol:    {asset}")
-            print(f"  Days:      {days}")
-            print(f"  Timeframe: M{timeframe}")
-            print(f"  Estimated: ~{days * 1440 // timeframe:,} candles\n")
-
-            fetch_count += 1
-            candles = await fetch_candles_for_asset(
-                client, asset, days, timeframe,
-                idx=fetch_count, total=fetch_count,
-            )
-
-            if not candles:
-                print(f"{Colors.RED}No candles fetched.{Colors.RESET}")
-            else:
-                filepath = save_candles_to_json(candles, asset, timeframe, days)
-                if filepath:
-                    print(f"{Colors.GREEN}OK Saved {len(candles)} candles to:{Colors.RESET}")
-                    print(f"  {Colors.CYAN}{filepath.absolute()}{Colors.RESET}")
-                else:
-                    print(f"{Colors.RED}Failed to save file.{Colors.RESET}")
-
-            # Wait for Enter for next fetch
-            print(f"\n{Colors.YELLOW}Press Enter to fetch another asset, or type 'exit' to quit.{Colors.RESET}")
+            # ====== بعد الدخول: عرض خيارين للمستخدم ======
+            print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+            print(f"{Colors.BOLD}  Choose a mode{Colors.RESET}")
+            print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+            print(f"  {Colors.YELLOW}1{Colors.RESET}) Enter an asset name manually  (single fetch)")
+            print(f"  {Colors.YELLOW}2{Colors.RESET}) Fetch all 13 OTC pairs automatically")
+            print(f"  {Colors.YELLOW}0{Colors.RESET}) Exit")
             try:
-                choice = (await ainput()).strip().lower()
-                if choice in ('exit', 'quit', 'q'):
-                    print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
-                    break
+                mode = (await ainput(f"{Colors.YELLOW}Your choice (1/2/0): {Colors.RESET}")).strip()
             except (EOFError, KeyboardInterrupt):
-                print(f"\n{Colors.YELLOW}Shutting down...{Colors.RESET}")
                 break
+            if mode in ('0', 'exit', 'quit', 'q'):
+                break
+            if mode == '2':
+                await run_batch_otc(holder, active_client_ref)
+            elif mode == '1':
+                await run_single(holder, active_client_ref)
+            else:
+                print(f"{Colors.RED}Unknown option. Please enter 1, 2, or 0.{Colors.RESET}")
     finally:
         # Cleanup
-        stop_keepalive.set()
+        stop_bg.set()
+        for t in (keepalive_task, reconnect_task):
+            try:
+                await asyncio.wait_for(t, timeout=2.0)
+            except Exception:
+                pass
         try:
-            await asyncio.wait_for(keepalive_task, timeout=2.0)
-        except Exception:
-            pass
-        try:
-            await client.close()
+            if holder.client:
+                await holder.client.close()
         except Exception:
             pass
         print(f"{Colors.CYAN}Shutdown complete.{Colors.RESET}")
+
+
+async def _get_active_client(holder: _ClientHolder, active_ref: dict, timeout: float = 30.0):
+    """انتظر حتى يكون لدى holder.client اتصال حي. يُستخدم قبل كل عملية جلب."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        c = active_ref.get("client") or holder.client
+        if _is_connection_alive(c):
+            return c
+        logmsg(f"{Colors.YELLOW}[fetcher] waiting for reconnect...{Colors.RESET}")
+        await asyncio.sleep(1.0)
+    return active_ref.get("client") or holder.client
+
+
+async def run_single(holder: _ClientHolder, active_ref: dict):
+    """خيار 1: المستخدم يُدخل اسم الأصل + عدد الأيام + الفريم."""
+    print(f"\n{Colors.CYAN}{'-'*60}{Colors.RESET}")
+    print(f"{Colors.BOLD}  Single asset fetch{Colors.RESET}")
+    print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
+
+    asset = await prompt_asset()
+    if asset is None:
+        return
+
+    days = await prompt_days()
+    if days is None:
+        return
+
+    timeframe = await prompt_timeframe()
+    if timeframe is None:
+        return
+
+    print(f"\n{Colors.CYAN}Summary:{Colors.RESET}")
+    print(f"  Asset:     {Colors.BOLD}{pretty_asset(asset, timeframe)}{Colors.RESET}")
+    print(f"  Symbol:    {asset}")
+    print(f"  Days:      {days}")
+    print(f"  Timeframe: M{timeframe}")
+    print(f"  Estimated: ~{days * 1440 // timeframe:,} candles\n")
+
+    client = await _get_active_client(holder, active_ref)
+    candles = await fetch_candles_for_asset(client, asset, days, timeframe, idx=1, total=1)
+    if candles:
+        fp = save_candles_to_json(candles, asset, timeframe, days)
+        if fp:
+            print(f"{Colors.GREEN}OK Saved {len(candles)} candles to:{Colors.RESET}\n  {Colors.CYAN}{fp.absolute()}{Colors.RESET}")
+        else:
+            print(f"{Colors.RED}Failed to save file.{Colors.RESET}")
+    else:
+        print(f"{Colors.RED}No candles fetched.{Colors.RESET}")
+
+
+async def run_batch_otc(holder: _ClientHolder, active_ref: dict):
+    """خيار 2: جلب الـ13 زوج OTC تلقائياً. المستخدم يُدخل الأيام والفريم فقط."""
+    print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"{Colors.BOLD}  Batch fetch — 13 OTC pairs{Colors.RESET}")
+    print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"  {Colors.DIM}Assets: {', '.join(OTC_ASSETS)}{Colors.RESET}\n")
+
+    days = await prompt_days()
+    if days is None:
+        return
+
+    timeframe = await prompt_timeframe()
+    if timeframe is None:
+        return
+
+    print(f"\n{Colors.CYAN}Batch summary:{Colors.RESET}")
+    print(f"  Pairs:     {len(OTC_ASSETS)}")
+    print(f"  Days:      {days}")
+    print(f"  Timeframe: M{timeframe}")
+    print(f"  Est. each: ~{days * 1440 // timeframe:,} candles")
+    print(f"  Est. total: ~{(days * 1440 // timeframe) * len(OTC_ASSETS):,} candles\n")
+    print(f"{Colors.YELLOW}Starting in 2 seconds... (Ctrl+C to cancel){Colors.RESET}")
+    await asyncio.sleep(2)
+
+    total = len(OTC_ASSETS)
+    successes = 0
+    failures = []
+    for idx, asset in enumerate(OTC_ASSETS, 1):
+        print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+        print(f"{Colors.BOLD}  [{idx}/{total}] {asset}{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+
+        # تحديث الكائن قبل كل جلبة لاستخدام أحدث اتصال
+        client = await _get_active_client(holder, active_ref)
+
+        candles = await fetch_candles_for_asset(
+            client, asset, days, timeframe,
+            idx=idx, total=total,
+        )
+        if candles:
+            fp = save_candles_to_json(candles, asset, timeframe, days)
+            if fp:
+                print(f"{Colors.GREEN}OK Saved {len(candles)} candles → {fp.name}{Colors.RESET}")
+                successes += 1
+            else:
+                print(f"{Colors.RED}Failed to save file for {asset}.{Colors.RESET}")
+                failures.append(asset)
+        else:
+            print(f"{Colors.RED}No candles fetched for {asset}.{Colors.RESET}")
+            failures.append(asset)
+
+    # ملخص نهائي
+    print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"{Colors.BOLD}  Batch complete{Colors.RESET}")
+    print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"  Successful: {Colors.GREEN}{successes}/{total}{Colors.RESET}")
+    if failures:
+        print(f"  Failed:     {Colors.RED}{len(failures)} — {', '.join(failures)}{Colors.RESET}")
+    print(f"  Output dir: {Colors.YELLOW}{CANDLES_DIR.absolute()}{Colors.RESET}")
 
 
 def main():

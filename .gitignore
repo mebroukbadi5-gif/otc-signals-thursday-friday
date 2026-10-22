@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+candles_otc_data/
+candles_data/
+credentials.json
+session.json
+candal.log
+browser/
+*.log
