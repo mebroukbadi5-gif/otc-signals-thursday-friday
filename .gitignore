@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 candles_otc_data/
 candles_data/
+instruments_data/
 credentials.json
 session.json
 candal.log
