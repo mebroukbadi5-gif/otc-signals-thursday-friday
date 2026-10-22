@@ -1092,10 +1092,9 @@ class Quotex:
 # ==============================================================================
 CREDENTIALS_FILE = Path("credentials.json")
 
-# كل عملية تشغيل تنشئ مجلد حفظ جديد بِطابع زمني حتى لا تختلط ببيانات سابقة.
-RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-CANDLES_DIR = Path("candles_otc_data") / RUN_TIMESTAMP
-CANDLES_DIR.mkdir(parents=True, exist_ok=True)
+# مجلد حفظ الشموع — ملفات JSON تُحفظ مباشرة هنا بدون مجلدات فرعية.
+CANDLES_DIR = Path("candles_otc_data")
+CANDLES_DIR.mkdir(exist_ok=True)
 
 # قائمة العملات الـ13 (OTC) — تُجلب تلقائياً عند اختيار الخيار 2 بعد تسجيل الدخول.
 OTC_ASSETS = [
