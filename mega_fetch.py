@@ -2791,25 +2791,22 @@ async def main_async():
     # Wait briefly for the WebSocket to settle
     await asyncio.sleep(1.5)
 
-    # Fetch instruments list (profit %)
-    elog.info("Fetching instruments list (for profit %)...")
-    instruments = InstrumentsFetcher(holder, interceptor)
-    instruments_ok = await instruments.fetch(timeout=30.0)
+    # The 13 OTC pairs are hardcoded in OTC_ASSETS — no need to fetch the
+    # instruments list. The MessageInterceptor will still CAPTURE profit %
+    # automatically if the server pushes it (via keepalive's periodic
+    # 42["instruments/get"] request), but we don't block on it.
 
-    # Subscribe to live prices for all OTC pairs
+    # Subscribe to live prices for all OTC pairs (the 13 hardcoded assets)
     live_sub = LivePriceSubscriber(interceptor)
     live_sub.subscribe_all(OTC_ASSETS, period=60)
-    elog.success(f"Subscribed to live prices for {len(OTC_ASSETS)} assets")
+    elog.success(f"Subscribed to live prices for {len(OTC_ASSETS)} OTC pairs")
 
     # Wait for live prices to arrive
     elog.info(f"Listening for live prices ({LIVE_PRICE_LISTEN_SECONDS}s)...")
     await asyncio.sleep(LIVE_PRICE_LISTEN_SECONDS)
 
-    # Print instruments summary (profit % + live price)
-    if instruments_ok:
-        instruments.print_summary(OTC_ASSETS)
-    else:
-        elog.warn("Could not fetch instruments list. Continuing without profit %.")
+    # Print summary table (profit % shows only if auto-pushed by server)
+    InstrumentsFetcher(holder, interceptor).print_summary(OTC_ASSETS)
 
     # Ask for timeframe
     timeframe = await prompt_timeframe()
