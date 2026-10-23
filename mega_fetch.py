@@ -2721,72 +2721,126 @@ class NeverSleepEngine:
                 elog.debug(f"[watchdog] error: {e}")
 
     async def auto_reconnect(self):
-        """Rebuild connection on loss with exponential backoff.
+        """Rebuild connection on loss — ported from wedsoket_.py:auto_reconnect.
 
-        Ported from wedsoket_.py:auto_reconnect.
+        Key differences from the previous version:
+          1. IMMEDIATE reconnect on first failure (delay=0)
+          2. Exponential backoff ONLY after consecutive failures
+          3. Re-installs the interceptor on the new WebSocketApp
+          4. Re-subscribes to all assets after reconnect
+          5. Uses the RECONNECTING flag to prevent overlapping attempts
         """
+        consecutive_failures = 0
         while not self.stop_event.is_set():
             await asyncio.sleep(RECONNECT_CHECK_INTERVAL)
-            # Record drop time if not already set
+
+            # Record drop time if connection is dead and not yet recorded
             if not self.connection_alive and self.last_drop_time == 0:
                 self.last_drop_time = time.time()
-                elog.info(f"[reconnect] connection loss detected at {self.last_drop_time:.0f}")
+                elog.info(f"[reconnect] connection loss detected at {self.last_drop_time:.0f}; "
+                          f"will re-fetch if outage > {LONG_DISCONNECT_THRESHOLD}s")
 
+            # Skip if connection is alive or already reconnecting
             if self.connection_alive or self.is_reconnecting:
+                consecutive_failures = 0
                 continue
 
             self.is_reconnecting = True
             try:
                 h = self.client_holder
-                backoff = RECONNECT_BACKOFF_BASE
-                for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
-                    if self.stop_event.is_set():
-                        return
-                    try:
-                        elog.info(f"[reconnect] attempt {attempt}/{MAX_RECONNECT_ATTEMPTS}")
-                        new_client = Quotex(
-                            email=h.email, password=h.password,
-                            host="quotex.com", lang="en", proxies=h.proxies,
-                        )
-                        check, reason = await new_client.connect()
-                        if check:
-                            try:
-                                await new_client.change_account("PRACTICE")
-                                await asyncio.sleep(0.5)
-                            except Exception:
-                                pass
-                            # Close old client
-                            try:
-                                if self.client_holder.client:
-                                    await self.client_holder.client.close()
-                            except Exception:
-                                pass
-                            # Swap in new client
-                            self.client_holder.client = new_client
-                            # Re-install interceptor on new WS client
-                            self.interceptor.client = new_client
-                            self.interceptor.install()
-                            self.connection_alive = True
-                            self.last_drop_time = 0
-                            self.connection_drops += 1
-                            self.last_message_at = time.time()
-                            drop_duration = time.time() - (self.last_drop_time or time.time())
-                            elog.success(f"[reconnect] reconnect successful on attempt {attempt}")
-                            if drop_duration > LONG_DISCONNECT_THRESHOLD:
-                                elog.warn(f"[reconnect] LONG disconnect detected "
-                                          f"({drop_duration/60:.1f} min) — may need full re-fetch")
-                            break
-                        else:
-                            err = str(reason) if reason else "Unknown"
-                            elog.warn(f"[reconnect] attempt {attempt} failed: {err}")
-                    except Exception as e:
-                        elog.warn(f"[reconnect] attempt {attempt} raised: {e}")
-                    if attempt < MAX_RECONNECT_ATTEMPTS:
-                        await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
+                if not (h.email and h.password):
+                    elog.warn("[reconnect] no credentials available — cannot reconnect")
+                    self.is_reconnecting = False
+                    continue
+
+                # IMMEDIATE reconnect on first failure, backoff after that
+                # (same as wedsoket_.py)
+                delay = 0 if consecutive_failures == 0 else min(
+                    RECONNECT_BACKOFF_BASE * (2 ** (consecutive_failures - 1)),
+                    RECONNECT_BACKOFF_MAX
+                )
+                if delay > 0:
+                    elog.info(f"[reconnect] connection lost, retrying in {delay:.0f}s...")
+                    await asyncio.sleep(delay)
                 else:
-                    elog.error(f"[reconnect] all {MAX_RECONNECT_ATTEMPTS} attempts failed; "
-                               f"will retry in {RECONNECT_CHECK_INTERVAL}s")
+                    elog.info("[reconnect] connection lost, reconnecting immediately...")
+
+                # Create new Quotex client and connect
+                new_client = Quotex(
+                    email=h.email, password=h.password,
+                    host="quotex.com", lang="en", proxies=h.proxies,
+                )
+                check, reason = await new_client.connect()
+
+                if check:
+                    elog.success("[reconnect] reconnect successful, restarting streams...")
+                    consecutive_failures = 0
+
+                    # Switch to PRACTICE account
+                    try:
+                        await new_client.change_account("PRACTICE")
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+
+                    # Update last_message_at to prevent stale watchdog
+                    if new_client.api is not None:
+                        new_client.api.last_message_at = time.time()
+
+                    # Close old client
+                    try:
+                        if self.client_holder.client:
+                            await self.client_holder.client.close()
+                    except Exception:
+                        pass
+
+                    # Swap in new client
+                    self.client_holder.client = new_client
+                    self.connection_alive = True
+                    self.last_message_at = time.time()
+
+                    # Calculate drop duration
+                    drop_duration = 0.0
+                    if self.last_drop_time > 0:
+                        drop_duration = time.time() - self.last_drop_time
+                        if drop_duration > LONG_DISCONNECT_THRESHOLD:
+                            elog.warn(f"[reconnect] LONG disconnect: {drop_duration/60:.1f} min "
+                                      f"> {LONG_DISCONNECT_THRESHOLD/60:.0f} min threshold")
+                        else:
+                            elog.info(f"[reconnect] short disconnect ({drop_duration:.1f}s)")
+
+                    self.last_drop_time = 0
+                    self.connection_drops += 1
+
+                    # Re-install interceptor on new WS client
+                    self.interceptor.client = new_client
+                    self.interceptor.install()
+
+                    # Re-subscribe to all assets (depth/follow + chart_notification)
+                    try:
+                        for asset in OTC_ASSETS:
+                            new_client.api.send_websocket_request(
+                                f'42["instruments/update",{{"asset":"{asset}","period":60}}]',
+                                no_force_send=False,
+                            )
+                            new_client.api.send_websocket_request(
+                                f'42["depth/follow","{asset}"]', no_force_send=False
+                            )
+                        new_client.api.send_websocket_request(
+                            '42["chart_notification/get"]', no_force_send=False
+                        )
+                        elog.success(f"[reconnect] re-subscribed to {len(OTC_ASSETS)} assets")
+                    except Exception as e:
+                        elog.warn(f"[reconnect] failed to re-subscribe: {e}")
+
+                else:
+                    err = str(reason) if reason else "Unknown"
+                    elog.warn(f"[reconnect] attempt failed: {err}")
+                    consecutive_failures += 1
+
+            except Exception as e:
+                elog.warn(f"[reconnect] unexpected error: {e}")
+                consecutive_failures += 1
             finally:
                 self.is_reconnecting = False
 
