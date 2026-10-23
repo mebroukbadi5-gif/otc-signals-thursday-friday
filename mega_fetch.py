@@ -2824,7 +2824,13 @@ class CandleFetcher:
     async def fetch_exactly_n(self, asset: str, timeframe_min: int,
                               target_count: int = TARGET_CANDLE_COUNT,
                               progress: bool = True) -> List[Dict]:
-        """Fetch exactly target_count candles for asset (OTC_canda_ method)."""
+        """Fetch exactly target_count candles for asset — OTC_canda_ method.
+
+        Calculates the MINIMUM days needed to get target_count candles
+        (instead of requesting 2 days for 500 M1 candles which fetches 2880).
+        For M1 + 500 candles: only ~9 hours needed (0.4 day).
+        For M5 + 500 candles: ~42 hours needed (~2 days).
+        """
         import math
         period_seconds = int(timeframe_min * 60)
         display_name = f"{asset} (M{timeframe_min})"
@@ -2836,20 +2842,80 @@ class CandleFetcher:
         print(f"\n  {paint_bold('Fetching ', C2.BRIGHT_CYAN)}"
               f"{paint_bold(f'{target_count} candles', C2.BRIGHT_GREEN)} — {display_name}")
 
-        # Calculate days needed: target_count candles * timeframe_min minutes
-        # / 1440 minutes per day, +1 day buffer to ensure we get enough.
-        days_needed = max(1, math.ceil(target_count * timeframe_min / 1440) + 1)
+        # === Calculate MINIMUM days needed for target_count candles ===
+        # target_count candles * period_seconds = total seconds needed
+        # Convert to days, +50% buffer to ensure enough after dedup.
+        total_seconds_needed = target_count * period_seconds
+        days_needed_float = total_seconds_needed / 86400
+        # Add 50% buffer (or at least 0.1 day = 2.4h)
+        days_needed = max(1, math.ceil(days_needed_float * 1.5))
         amount_of_seconds = int(days_needed * 86400)
-        # Timeout: 60s minimum, +60s per day
-        timeout = max(60, days_needed * 60)
+        # Timeout: 60s minimum, +30s per day
+        timeout = max(60, days_needed * 30)
         fetch_start = time.time()
 
+        expected_candles = days_needed * 1440 // timeframe_min
         elog.info(f"Requesting {days_needed} day(s) of {asset} history "
-                  f"(~{days_needed * 1440 // timeframe_min:,} candles expected)")
+                  f"(~{expected_candles:,} candles expected, need {target_count})")
+
+        # === Progress callback (same as OTC_canda_.py) ===
+        # Shared progress tracker for all 5 workers
+        progress_state = {
+            'candles': 0,
+            'oldest_ts': int(time.time()),
+            'start_ts': int(time.time()),
+            'target_ts': int(time.time()) - amount_of_seconds,
+            'lock': threading.Lock(),
+            'last_print': 0.0,
+            'fetch_start': fetch_start,
+            'worker_candles': [0] * 5,
+        }
+
+        def progress_callback(seconds_done, total_seconds, candles_count, worker_label):
+            now = time.time()
+            with progress_state['lock']:
+                try:
+                    wid = int(worker_label.split('-')[1]) if '-' in worker_label else 0
+                    if 0 <= wid < 5:
+                        progress_state['worker_candles'][wid] = candles_count
+                except Exception:
+                    pass
+                progress_state['candles'] = sum(progress_state['worker_candles'])
+                current_oldest = progress_state['start_ts'] - seconds_done
+                if current_oldest < progress_state['oldest_ts']:
+                    progress_state['oldest_ts'] = current_oldest
+                # Throttle prints to 0.3s
+                if now - progress_state['last_print'] < 0.3:
+                    return
+                progress_state['last_print'] = now
+
+                elapsed = now - progress_state['fetch_start']
+                total_span = progress_state['start_ts'] - progress_state['target_ts']
+                done_span = progress_state['start_ts'] - progress_state['oldest_ts']
+                pct = min(done_span / total_span, 1.0) if total_span > 0 else 0
+                bar_len = 30
+                filled = int(bar_len * pct)
+                bar = paint(C2.BRIGHT_GREEN, '█' * filled) + paint(C2.DIM, '░' * (bar_len - filled))
+                speed = progress_state['candles'] / elapsed if elapsed > 0 else 0
+                if pct > 0.01:
+                    eta = elapsed * (1.0 - pct) / pct
+                    eta_str = f"{int(eta//60):02d}:{int(eta%60):02d}"
+                else:
+                    eta_str = "  ?  "
+                elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
+                candle_count = progress_state['candles']
+                sys.stdout.write(
+                    f"\r  {paint('[', C2.DIM)}{bar}{paint(']', C2.DIM)} "
+                    f"{pct*100:5.1f}% | "
+                    f"{paint_bold(str(candle_count), C2.BRIGHT_GREEN)}"
+                    f"/{target_count} | "
+                    f"{elapsed_str} | "
+                    f"{speed:>5.0f} c/s | "
+                    f"ETA {eta_str}   "
+                )
+                sys.stdout.flush()
 
         # === SINGLE CALL — same as OTC_canda_.py:fetch_candles_for_asset ===
-        # This calls client.get_historical_candles which internally splits the
-        # span into 5 parallel workers and waits for all to complete.
         try:
             candles_raw = await asyncio.wait_for(
                 client.get_historical_candles(
@@ -2857,14 +2923,25 @@ class CandleFetcher:
                     amount_of_seconds=amount_of_seconds,
                     period=period_seconds,
                     max_workers=5,
-                    progress_callback=None,
+                    progress_callback=progress_callback,
                 ),
                 timeout=timeout,
             )
+            # Force a 100% progress print
+            with progress_state['lock']:
+                progress_state['candles'] = len(candles_raw) if candles_raw else 0
+                progress_state['oldest_ts'] = progress_state['target_ts']
+                progress_state['last_print'] = 0
+            if progress:
+                progress_callback(amount_of_seconds, amount_of_seconds,
+                                  len(candles_raw) if candles_raw else 0, "Worker-0")
+                print()  # newline after progress bar
         except asyncio.TimeoutError:
+            if progress: print()
             elog.error(f"Fetch timed out after {timeout}s for {asset}.")
             return []
         except Exception as e:
+            if progress: print()
             elog.error(f"Fetch raised for {asset}: {e}")
             return []
 
