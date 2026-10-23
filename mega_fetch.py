@@ -1785,14 +1785,18 @@ LIVE_PRICE_BROADCAST_INTERVAL = 0.5
 # DEBUG: when True, every WS message is logged for diagnosis.
 # Disable by setting this to False in production.
 # Set to True ONLY when debugging protocol issues — it produces A LOT of output.
-DEBUG_WS_TRAFFIC = False          # was True — disabled (too noisy, see DEBUG_WS_TYPES)
+DEBUG_WS_TRAFFIC = False          # was True — disabled (too noisy)
 DEBUG_BINARY_PREVIEW_BYTES = 32
 DEBUG_TEXT_PREVIEW_CHARS = 200
 
 # More granular debug: only log specific message types when DEBUG_WS_TRAFFIC
 # is False. Each entry is a substring to match in the text/binary content.
 # Empty list = no granular logging.
-DEBUG_WS_TYPES = ["depth/change"]  # log only payout updates (not every tick)
+# NOTE: depth/change ANNOUNCEMENTS ('451-["depth/change",{"_placeholder":...}]')
+# arrive every ~1 second, so even with this filter the log is noisy.
+# Keep this list EMPTY for clean output; the [depth/change] SUCCESS log
+# in _handle_depth_change already shows progress.
+DEBUG_WS_TYPES = []  # empty = no per-frame debug logs
 
 # Fetch strategy
 CHUNK_CANDLES = 60
