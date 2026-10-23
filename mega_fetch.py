@@ -2417,11 +2417,16 @@ class LivePriceSubscriber:
 # SECTION 12: CANDLE FETCHER (chunked, with gap-fill)
 # ============================================================================
 class CandleFetcher:
-    """Fetches exactly N candles for an asset using overlapping chunks.
+    """Fetches exactly N candles for an asset — same method as OTC_canda_.py.
 
-    Uses Quotex's get_historical_candles (which sends 42["history/load",...]
-    internally and waits for the candles_ready event). Then deduplicates,
-    fills gaps, and truncates/pads to exactly target_count.
+    Instead of the broken "overlapping chunks" approach, this uses the SAME
+    method as the original OTC_canda_.py:
+      1. Calculate days needed: days = ceil(target_count * timeframe_min / 1440) + buffer
+      2. Call client.get_historical_candles(asset, amount_of_seconds=days*86400,
+         period=period_seconds, max_workers=5) — this is ONE call that fetches
+         the entire span, with max_workers=5 doing parallel chunks internally.
+      3. Dedup by timestamp + sort + gap-fill
+      4. Truncate to last target_count candles (or pad if insufficient)
     """
 
     def __init__(self, client_holder: ClientHolder, interceptor: MessageInterceptor):
@@ -2431,7 +2436,8 @@ class CandleFetcher:
     async def fetch_exactly_n(self, asset: str, timeframe_min: int,
                               target_count: int = TARGET_CANDLE_COUNT,
                               progress: bool = True) -> List[Dict]:
-        """Fetch exactly target_count candles for asset."""
+        """Fetch exactly target_count candles for asset (OTC_canda_ method)."""
+        import math
         period_seconds = int(timeframe_min * 60)
         display_name = f"{asset} (M{timeframe_min})"
         client = self.client_holder.client
@@ -2442,103 +2448,74 @@ class CandleFetcher:
         print(f"\n  {paint_bold('Fetching ', C2.BRIGHT_CYAN)}"
               f"{paint_bold(f'{target_count} candles', C2.BRIGHT_GREEN)} — {display_name}")
 
-        now_ts = int(time.time())
-        timeout = max(60, target_count * 5)
-        candles_map: Dict[int, Dict] = {}
+        # Calculate days needed: target_count candles * timeframe_min minutes
+        # / 1440 minutes per day, +1 day buffer to ensure we get enough.
+        days_needed = max(1, math.ceil(target_count * timeframe_min / 1440) + 1)
+        amount_of_seconds = int(days_needed * 86400)
+        # Timeout: 60s minimum, +60s per day
+        timeout = max(60, days_needed * 60)
         fetch_start = time.time()
 
-        chunk_offset = CHUNK_CANDLES * period_seconds
-        step_offset = (CHUNK_CANDLES - OVERLAP_CANDLES) * period_seconds
-        current_time = now_ts
-        chunks_fetched = 0
-        max_chunks = max(40, (target_count // (CHUNK_CANDLES - OVERLAP_CANDLES)) + 10)
-        consecutive_empty = 0
+        elog.info(f"Requesting {days_needed} day(s) of {asset} history "
+                  f"(~{days_needed * 1440 // timeframe_min:,} candles expected)")
 
-        async def fetch_one(fetch_time: float) -> List[Dict]:
-            aligned = int(fetch_time // period_seconds) * period_seconds
+        # === SINGLE CALL — same as OTC_canda_.py:fetch_candles_for_asset ===
+        # This calls client.get_historical_candles which internally splits the
+        # span into 5 parallel workers and waits for all to complete.
+        try:
+            candles_raw = await asyncio.wait_for(
+                client.get_historical_candles(
+                    asset,
+                    amount_of_seconds=amount_of_seconds,
+                    period=period_seconds,
+                    max_workers=5,
+                    progress_callback=None,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            elog.error(f"Fetch timed out after {timeout}s for {asset}.")
+            return []
+        except Exception as e:
+            elog.error(f"Fetch raised for {asset}: {e}")
+            return []
+
+        if not candles_raw:
+            elog.error(f"No candles returned for {asset}.")
+            return []
+
+        elapsed = time.time() - fetch_start
+        elog.info(f"Received {len(candles_raw):,} raw candles in {int(elapsed)}s")
+
+        # === DEDUP + FORMAT (same as OTC_canda_.py) ===
+        candles_map: Dict[int, Dict] = {}
+        for c in candles_raw:
+            if not isinstance(c, dict):
+                continue
             try:
-                candles = await asyncio.wait_for(
-                    client.get_historical_candles(
-                        asset,
-                        amount_of_seconds=chunk_offset,
-                        period=period_seconds,
-                        max_workers=3,
-                        progress_callback=None,
-                    ),
-                    timeout=timeout,
-                )
-                return candles or []
-            except Exception as e:
-                elog.debug(f"chunk fetch error at {int(fetch_time)}: {e}")
-                return []
-
-        while len(candles_map) < target_count and chunks_fetched < max_chunks:
-            batch_times = []
-            t = current_time
-            for _ in range(FETCH_BATCH_SIZE):
-                batch_times.append(t)
-                t -= step_offset
-
-            results = await asyncio.gather(*[fetch_one(t) for t in batch_times])
-            chunks_fetched += FETCH_BATCH_SIZE
-
-            has_new = False
-            batch_oldest = current_time
-            for raw in results:
-                if not raw:
-                    continue
-                for c in raw:
-                    try:
-                        ts = int(c.get("time", c.get("timestamp", 0)))
-                        aligned = (ts // period_seconds) * period_seconds
-                        o = float(c.get("open", 0))
-                        h = float(c.get("high", c.get("max", 0)))
-                        l = float(c.get("low", c.get("min", 0)))
-                        cl = float(c.get("close", 0))
-                        if aligned not in candles_map and o > 0 and h > 0 and l > 0 and cl > 0:
-                            candles_map[aligned] = {
-                                'time': aligned, 'open': o, 'high': h,
-                                'low': l, 'close': cl,
-                                'volume': int(c.get("volume", 0) or 0),
-                            }
-                            has_new = True
-                            if aligned < batch_oldest:
-                                batch_oldest = aligned
-                    except Exception:
-                        continue
-
-            if not has_new:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    elog.warn(f"Reached end of available data for {asset}.")
-                    break
-            else:
-                consecutive_empty = 0
-                current_time = batch_oldest - (OVERLAP_CANDLES * period_seconds)
-
-            if progress:
-                elapsed = time.time() - fetch_start
-                pct = min(len(candles_map) / target_count, 1.0)
-                bar_len = 30
-                filled = int(bar_len * pct)
-                bar = paint(C2.BRIGHT_GREEN, '█' * filled) + paint(C2.DIM, '░' * (bar_len - filled))
-                sys.stdout.write(
-                    f"\r  {paint('[', C2.DIM)}{bar}{paint(']', C2.DIM)} "
-                    f"{pct*100:5.1f}% | "
-                    f"{paint_bold(f'{len(candles_map)}', C2.BRIGHT_GREEN)}/{target_count} | "
-                    f"{int(elapsed):>3}s   "
-                )
-                sys.stdout.flush()
-
-        if progress:
-            print()
+                ts = int(c.get("time", c.get("timestamp", 0)))
+                aligned = (ts // period_seconds) * period_seconds
+                o = float(c.get("open", 0))
+                h = float(c.get("high", c.get("max", 0)))
+                l = float(c.get("low", c.get("min", 0)))
+                cl = float(c.get("close", 0))
+                if aligned not in candles_map and o > 0 and h > 0 and l > 0 and cl > 0:
+                    candles_map[aligned] = {
+                        'time': aligned, 'open': o, 'high': h,
+                        'low': l, 'close': cl,
+                        'volume': int(c.get("volume", 0) or 0),
+                    }
+            except Exception:
+                continue
 
         if not candles_map:
-            elog.error(f"No candles fetched for {asset}.")
+            elog.error(f"No valid candles after dedup for {asset}.")
             return []
 
         # Sort by time
         candles = sorted(candles_map.values(), key=lambda x: x['time'])
+        elog.info(f"After dedup: {len(candles):,} unique candles "
+                  f"({candles[0]['time']} → {candles[-1]['time']})")
 
         # Apply gap-filling
         before_fill = len(candles)
@@ -2551,6 +2528,7 @@ class CandleFetcher:
         # Truncate or pad to exactly target_count
         if len(candles) > target_count:
             candles = candles[-target_count:]
+            elog.info(f"Truncated to last {target_count} candles.")
         elif len(candles) < target_count:
             first_ts = candles[0]['time']
             last_close = candles[0]['open']
