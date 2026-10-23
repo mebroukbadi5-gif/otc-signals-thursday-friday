@@ -3369,8 +3369,15 @@ async def main_async():
     # Ask for timeframe
     timeframe = await prompt_timeframe()
     if timeframe is None:
-        await live_sub.unsubscribe_all()
-        await engine.stop()
+        # Cleanup — unsubscribe_all is SYNC, not async
+        try:
+            live_sub.unsubscribe_all()
+        except Exception:
+            pass
+        try:
+            await engine.stop()
+        except Exception:
+            pass
         try:
             await client.close()
         except Exception:
@@ -3443,8 +3450,16 @@ async def main_async():
 
     finally:
         # Cleanup
-        await live_sub.unsubscribe_all()
-        await engine.stop()
+        # unsubscribe_all() is SYNC (not async), so no await
+        try:
+            live_sub.unsubscribe_all()
+        except Exception:
+            pass
+        # engine.stop() is async
+        try:
+            await engine.stop()
+        except Exception:
+            pass
         interceptor.restore()
         try:
             await client.close()
