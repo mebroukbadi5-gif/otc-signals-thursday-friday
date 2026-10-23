@@ -1776,7 +1776,10 @@ RECONNECT_BACKOFF_MAX = 60         # maximum backoff
 LONG_DISCONNECT_THRESHOLD = 3600   # 1 hour — triggers full re-fetch
 
 # Live price settings
-LIVE_PRICE_LISTEN_SECONDS = 10.0   # increased from 5 to give more time for data
+LIVE_PRICE_LISTEN_SECONDS = 20.0   # increased to 20s — Quotex sends fluctuating
+                                   # payout values; we need time to capture the
+                                   # HIGH value for each asset (alternates
+                                   # between CALL and PUT payouts every 1-2s)
 LIVE_PRICE_BROADCAST_INTERVAL = 0.5
 
 # DEBUG: when True, every WS message is logged for diagnosis.
@@ -2110,17 +2113,20 @@ class MessageInterceptor:
         Format: [["EURUSD_otc",95], ["USDARS_otc",92], ...]
         Each entry: [asset_name, payout_percent]
 
-        IMPORTANT: The Quotex server sends DIFFERENT payout values over time
-        for the SAME asset (e.g. USDZAR_otc might appear as 96%, then later
-        as 5%, then later as 96% again). This happens because the server
-        sometimes sends the payout for the OPPOSITE direction (PUT vs CALL),
-        or sends 0 during the brief moment when a payout is being recalculated.
+        IMPORTANT: The Quotex server sends FLUCTUATING payout values for the
+        SAME asset over time. From real-world logs:
+          USDZAR_otc: 96% → 5% → 96% → 5% (alternating!)
+          USDEGP_otc: 85% → 14% → 85% → 14%
+          USDIDR_otc: 89% → 85% → 89% → 85%
 
-        To handle this, we keep BOTH:
-          - max profit (the highest payout % seen — this is the real one)
-          - last profit (the most recent value)
-          - history (all values seen, for debugging)
-        The summary table uses MAX profit, which is always the real payout.
+        This happens because:
+          - The server alternates between CALL payout and PUT payout
+          - Low values are sent during payout recalculation
+          - Different values for different trade directions
+
+        Strategy: keep MAX value (the real payout is always the highest).
+        The MAX will stabilize after a few seconds when we've seen at least
+        one 'high' value for each asset.
         """
         if not isinstance(data, list):
             return
@@ -2133,9 +2139,9 @@ class MessageInterceptor:
                     payout_int = int(payout)
                     # Track history for debugging
                     self.profit_history[asset].append(payout_int)
-                    # Keep only last 20 values to avoid memory bloat
-                    if len(self.profit_history[asset]) > 20:
-                        self.profit_history[asset] = self.profit_history[asset][-20:]
+                    # Keep only last 30 values
+                    if len(self.profit_history[asset]) > 30:
+                        self.profit_history[asset] = self.profit_history[asset][-30:]
                     # Save last value (for reference)
                     self.profit_by_asset[asset] = payout_int
                     # Keep the MAX profit (real payout is always the highest)
@@ -2145,8 +2151,11 @@ class MessageInterceptor:
                         self.enabled_by_asset[asset] = True
                     new_count += 1
         if new_count > 0 and DEBUG_WS_TRAFFIC:
-            elog.info(f"[depth/change] payout captured for {new_count} assets "
-                      f"(total known: {len(self.max_profit_by_asset)})")
+            # Show only the highest payout per asset (more useful than the full list)
+            high_assets = [(a, p) for a, p in self.max_profit_by_asset.items() if p >= 70]
+            elog.info(f"[depth/change] +{new_count} updates | "
+                      f"assets with payout>=70%: {len(high_assets)}/"
+                      f"{len(self.max_profit_by_asset)}")
 
     def _handle_quotes_stream(self, data: Any) -> None:
         """Handle quotes/stream binary frame: live price ticks.
@@ -3136,31 +3145,49 @@ async def main_async():
     elog.success(f"Subscribed to live prices for {len(OTC_ASSETS)} OTC pairs")
 
     # Wait for live prices AND payout data to arrive.
-    # We poll every 0.5s up to LIVE_PRICE_LISTEN_SECONDS, and also accept
-    # early exit if we've collected payout for at least 10 assets AND
-    # live price for at least 10 assets.
+    # Quotex sends FLUCTUATING payout values (alternates between CALL and PUT
+    # payouts), so we need to wait until we've seen the HIGH value for each asset.
+    # Strategy: wait until we have MAX profit >= 70% for at least 10 of the 13
+    # OTC assets, OR until LIVE_PRICE_LISTEN_SECONDS elapses.
     elog.info(f"Listening for live prices + payout data (up to {LIVE_PRICE_LISTEN_SECONDS}s)...")
+    elog.info(f"Quotex sends fluctuating payouts (CALL/PUT alternating) — "
+              f"waiting for HIGH values to stabilize...")
     deadline = time.time() + LIVE_PRICE_LISTEN_SECONDS
+    last_status_time = 0
     while time.time() < deadline:
-        n_profit = len(interceptor.profit_by_asset)
+        # Count assets with high payout (>=70%) — these are confirmed real
+        high_payout_assets = sum(
+            1 for p in interceptor.max_profit_by_asset.values() if p >= 70
+        )
+        n_profit = len(interceptor.max_profit_by_asset)
         n_live = len(interceptor.live_prices)
-        if n_profit >= 10 and n_live >= 10:
-            elog.success(f"Got data: {n_profit} payout%, {n_live} live prices — "
-                         f"stopping early.")
+
+        # Print status every 5 seconds
+        now = time.time()
+        if now - last_status_time >= 5:
+            elog.info(f"Status: {n_profit} payout% entries ({high_payout_assets} >=70%), "
+                      f"{n_live} live prices, {int(deadline - now)}s remaining")
+            last_status_time = now
+
+        # Early exit if we have high payouts for at least 10 of 13 OTC pairs
+        if high_payout_assets >= 10 and n_live >= 10:
+            elog.success(f"Got high payouts for {high_payout_assets} assets "
+                         f"and {n_live} live prices — stopping early.")
             break
         await asyncio.sleep(0.5)
 
-    n_profit = len(interceptor.profit_by_asset)
+    n_profit = len(interceptor.max_profit_by_asset)
+    high_payout_assets = sum(1 for p in interceptor.max_profit_by_asset.values() if p >= 70)
     n_live = len(interceptor.live_prices)
-    elog.info(f"Collected: {n_profit} payout% entries, {n_live} live prices")
+    elog.info(f"Final: {n_profit} payout% entries ({high_payout_assets} with >=70%), "
+              f"{n_live} live prices")
 
     if n_profit == 0:
         elog.warn("No payout data received. Server may not have pushed depth/change yet.")
-        elog.warn("Will continue anyway — payout % column will show N/A.")
     if n_live == 0:
         elog.warn("No live prices received. Market may be closed or subscription failed.")
 
-    # Print summary table (now with real data)
+    # Print summary table (now with real MAX payouts)
     InstrumentsFetcher(holder, interceptor).print_summary(OTC_ASSETS)
 
     # Ask for timeframe
