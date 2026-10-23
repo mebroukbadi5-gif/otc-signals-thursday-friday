@@ -1784,9 +1784,15 @@ LIVE_PRICE_BROADCAST_INTERVAL = 0.5
 
 # DEBUG: when True, every WS message is logged for diagnosis.
 # Disable by setting this to False in production.
-DEBUG_WS_TRAFFIC = True
+# Set to True ONLY when debugging protocol issues — it produces A LOT of output.
+DEBUG_WS_TRAFFIC = False          # was True — disabled (too noisy, see DEBUG_WS_TYPES)
 DEBUG_BINARY_PREVIEW_BYTES = 32
 DEBUG_TEXT_PREVIEW_CHARS = 200
+
+# More granular debug: only log specific message types when DEBUG_WS_TRAFFIC
+# is False. Each entry is a substring to match in the text/binary content.
+# Empty list = no granular logging.
+DEBUG_WS_TYPES = ["depth/change"]  # log only payout updates (not every tick)
 
 # Fetch strategy
 CHUNK_CANDLES = 60
@@ -1954,21 +1960,31 @@ class MessageInterceptor:
                             + UTF-8 preview (after 0x04 strip)
         """
         # === DEBUG LOGGING ===
-        if DEBUG_WS_TRAFFIC:
+        # Log a frame ONLY if:
+        #   - DEBUG_WS_TRAFFIC is True (log everything), OR
+        #   - DEBUG_WS_TYPES contains a substring that matches the frame content
+        if DEBUG_WS_TRAFFIC or DEBUG_WS_TYPES:
             try:
                 if isinstance(msg, (bytes, bytearray)):
                     raw = bytes(msg)
-                    preview_hex = raw[:DEBUG_BINARY_PREVIEW_BYTES].hex(' ')
                     utf8_preview = ""
                     if len(raw) > 0:
                         offset = 1 if raw[0] == 0x04 else 0
                         utf8_preview = raw[offset:offset + 100].decode('utf-8', errors='replace')
-                    elog.debug(f"[ws-debug] BINARY {len(raw):,}B | hex: {preview_hex} | utf8: {utf8_preview!r}")
+                    # Check if any DEBUG_WS_TYPE matches the content
+                    should_log = DEBUG_WS_TRAFFIC or any(
+                        t in utf8_preview for t in DEBUG_WS_TYPES
+                    )
+                    if should_log:
+                        preview_hex = raw[:DEBUG_BINARY_PREVIEW_BYTES].hex(' ')
+                        elog.debug(f"[ws-debug] BINARY {len(raw):,}B | hex: {preview_hex} | utf8: {utf8_preview!r}")
                 else:
                     text = msg if isinstance(msg, str) else msg.decode("utf-8", errors="ignore")
-                    preview = text[:DEBUG_TEXT_PREVIEW_CHARS]
-                    trunc = "…" if len(text) > DEBUG_TEXT_PREVIEW_CHARS else ""
-                    elog.debug(f"[ws-debug] TEXT {len(text):,}c | {preview!r}{trunc}")
+                    should_log = DEBUG_WS_TRAFFIC or any(t in text for t in DEBUG_WS_TYPES)
+                    if should_log:
+                        preview = text[:DEBUG_TEXT_PREVIEW_CHARS]
+                        trunc = "…" if len(text) > DEBUG_TEXT_PREVIEW_CHARS else ""
+                        elog.debug(f"[ws-debug] TEXT {len(text):,}c | {preview!r}{trunc}")
             except Exception as e:
                 elog.debug(f"[ws-debug] preview error: {e}")
 
@@ -2177,6 +2193,8 @@ class MessageInterceptor:
                     new_count += 1
         if new_count > 0 and DEBUG_WS_TRAFFIC:
             # Show total ticks received across all assets (more meaningful than unique count)
+            # Only log when DEBUG_WS_TRAFFIC is True (too noisy otherwise — ticks arrive
+            # many times per second).
             total_ticks = sum(self.live_ticks_seen.values())
             elog.debug(f"[quotes/stream] +{new_count} tick | "
                        f"total ticks: {total_ticks} | assets tracked: {len(self.live_prices)}")
