@@ -2734,6 +2734,38 @@ class LivePriceSubscriber:
         for asset in assets:
             self.subscribe(asset, period)
 
+    def refresh_payouts(self, assets: List[str]) -> None:
+        """Force-refresh payout % for each asset by sending chart_notification/get
+        with the asset name explicitly.
+
+        The Quotex server responds to this by sending a fresh depth/change
+        frame with the CURRENT payout for that asset (both CALL and PUT
+        directions, alternating).
+
+        This is the key trick: by sending the request FOR EACH ASSET
+        individually, we force the server to send us the latest payout
+        for each one, instead of waiting for the periodic broadcast.
+        """
+        api = self.interceptor.client.api
+        for asset in assets:
+            try:
+                # 1) Update the asset (sets it as the active chart)
+                api.send_websocket_request(
+                    f'42["instruments/update",{{"asset":"{asset}","period":60}}]',
+                    no_force_send=False,
+                )
+                # 2) Request chart notification — server responds with payout
+                api.send_websocket_request(
+                    f'42["chart_notification/get",{{"asset":"{asset}","version":"1.0.0"}}]',
+                    no_force_send=False,
+                )
+                # 3) Follow depth for this asset — forces payout push
+                api.send_websocket_request(f'42["depth/follow","{asset}"]', no_force_send=False)
+                # 4) Also request instruments/get — server may push full list
+                api.send_websocket_request('42["instruments/get"]', no_force_send=False)
+            except Exception as e:
+                elog.debug(f"[refresh] failed for {asset}: {e}")
+
     def unsubscribe(self, asset: str) -> None:
         api = self.interceptor.client.api
         try:
@@ -3147,14 +3179,26 @@ async def main_async():
     # Wait for live prices AND payout data to arrive.
     # Quotex sends FLUCTUATING payout values (alternates between CALL and PUT
     # payouts), so we need to wait until we've seen the HIGH value for each asset.
-    # Strategy: wait until we have MAX profit >= 70% for at least 10 of the 13
-    # OTC assets, OR until LIVE_PRICE_LISTEN_SECONDS elapses.
+    # Strategy:
+    #   1. Send refresh_payouts() every 3 seconds to force the server to push
+    #      fresh payout values for each asset individually.
+    #   2. Wait until we have MAX profit >= 70% for at least 10 of the 13 OTC
+    #      assets, OR until LIVE_PRICE_LISTEN_SECONDS elapses.
     elog.info(f"Listening for live prices + payout data (up to {LIVE_PRICE_LISTEN_SECONDS}s)...")
     elog.info(f"Quotex sends fluctuating payouts (CALL/PUT alternating) — "
-              f"waiting for HIGH values to stabilize...")
+              f"forcing refresh every 3s...")
     deadline = time.time() + LIVE_PRICE_LISTEN_SECONDS
     last_status_time = 0
+    last_refresh_time = 0
+    refresh_count = 0
     while time.time() < deadline:
+        # Force-refresh payouts every 3 seconds
+        now = time.time()
+        if now - last_refresh_time >= 3:
+            live_sub.refresh_payouts(OTC_ASSETS)
+            refresh_count += 1
+            last_refresh_time = now
+
         # Count assets with high payout (>=70%) — these are confirmed real
         high_payout_assets = sum(
             1 for p in interceptor.max_profit_by_asset.values() if p >= 70
@@ -3163,24 +3207,40 @@ async def main_async():
         n_live = len(interceptor.live_prices)
 
         # Print status every 5 seconds
-        now = time.time()
         if now - last_status_time >= 5:
             elog.info(f"Status: {n_profit} payout% entries ({high_payout_assets} >=70%), "
-                      f"{n_live} live prices, {int(deadline - now)}s remaining")
+                      f"{n_live} live prices, refresh #{refresh_count}, "
+                      f"{int(deadline - now)}s remaining")
             last_status_time = now
 
         # Early exit if we have high payouts for at least 10 of 13 OTC pairs
         if high_payout_assets >= 10 and n_live >= 10:
             elog.success(f"Got high payouts for {high_payout_assets} assets "
-                         f"and {n_live} live prices — stopping early.")
+                         f"and {n_live} live prices (after {refresh_count} refreshes) — "
+                         f"stopping early.")
             break
         await asyncio.sleep(0.5)
+
+    # If still not all assets have high payouts, do ONE more refresh + wait 5s
+    high_payout_assets = sum(1 for p in interceptor.max_profit_by_asset.values() if p >= 70)
+    if high_payout_assets < len(OTC_ASSETS):
+        elog.warn(f"Only {high_payout_assets}/{len(OTC_ASSETS)} assets have "
+                  f"payout >= 70%. Doing final refresh + 5s wait...")
+        live_sub.refresh_payouts(OTC_ASSETS)
+        await asyncio.sleep(5.0)
 
     n_profit = len(interceptor.max_profit_by_asset)
     high_payout_assets = sum(1 for p in interceptor.max_profit_by_asset.values() if p >= 70)
     n_live = len(interceptor.live_prices)
     elog.info(f"Final: {n_profit} payout% entries ({high_payout_assets} with >=70%), "
-              f"{n_live} live prices")
+              f"{n_live} live prices, {refresh_count} refreshes sent")
+
+    # List assets that still have low payout (for debugging)
+    low_payout = [(a, p) for a, p in interceptor.max_profit_by_asset.items() if p < 70]
+    if low_payout:
+        elog.warn(f"Assets with payout < 70% (may need more time):")
+        for a, p in low_payout:
+            elog.warn(f"  {a}: max={p}%  history={interceptor.profit_history[a][-5:]}")
 
     if n_profit == 0:
         elog.warn("No payout data received. Server may not have pushed depth/change yet.")
