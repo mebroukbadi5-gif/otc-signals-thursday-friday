@@ -2180,25 +2180,24 @@ class MessageInterceptor:
         """Handle depth/change binary frame: payout % per asset.
 
         Format: [["EURUSD_otc",95], ["USDARS_otc",92], ...]
-        Each entry: [asset_name, payout_percent]
 
-        IMPORTANT: The Quotex server sends FLUCTUATING payout values for the
-        SAME asset over time. From real-world logs:
-          USDZAR_otc: 96% → 5% → 96% → 5% (alternating!)
-          USDEGP_otc: 85% → 14% → 85% → 14%
-          USDIDR_otc: 89% → 85% → 89% → 85%
+        IMPORTANT: The Quotex server sends FLUCTUATING values for the same
+        asset — some are the CALL payout, some are the PUT payout, and some
+        are transitional/garbage values. From the user's observation:
+          - Real payout for OTC pairs is ALWAYS between 70% and 94%
+          - Values > 94% (like 96%, 97%, 98%) are NOT real payouts
+          - Values < 70% (like 4%, 11%, 28%, 44%) are NOT real payouts
 
-        This happens because:
-          - The server alternates between CALL payout and PUT payout
-          - Low values are sent during payout recalculation
-          - Different values for different trade directions
-
-        Strategy: keep MAX value (the real payout is always the highest).
-        The MAX will stabilize after a few seconds when we've seen at least
-        one 'high' value for each asset.
+        Strategy: FILTER OUT any value outside [70, 94].
+        Only accept values in this valid range, then keep the MAX.
         """
         if not isinstance(data, list):
             return
+
+        # Valid payout range for Quotex OTC pairs (user confirmed)
+        PAYOUT_MIN = 70
+        PAYOUT_MAX = 94
+
         new_count = 0
         for item in data:
             if isinstance(item, list) and len(item) >= 2:
@@ -2206,25 +2205,31 @@ class MessageInterceptor:
                 payout = item[1]
                 if isinstance(asset, str) and isinstance(payout, (int, float)):
                     payout_int = int(payout)
+
+                    # FILTER: only accept values in the valid payout range
+                    if payout_int < PAYOUT_MIN or payout_int > PAYOUT_MAX:
+                        continue  # skip — not a real payout
+
                     # Track history for debugging
                     self.profit_history[asset].append(payout_int)
-                    # Keep only last 30 values
                     if len(self.profit_history[asset]) > 30:
                         self.profit_history[asset] = self.profit_history[asset][-30:]
-                    # Save last value (for reference)
+
+                    # Save last valid value
                     self.profit_by_asset[asset] = payout_int
-                    # Keep the MAX profit (real payout is always the highest)
+
+                    # Keep MAX of valid values
                     if payout_int > self.max_profit_by_asset.get(asset, 0):
                         self.max_profit_by_asset[asset] = payout_int
+
                     if asset not in self.enabled_by_asset:
                         self.enabled_by_asset[asset] = True
                     new_count += 1
+
         if new_count > 0 and DEBUG_WS_TRAFFIC:
-            # Show only the highest payout per asset (more useful than the full list)
             high_assets = [(a, p) for a, p in self.max_profit_by_asset.items() if p >= 70]
-            elog.info(f"[depth/change] +{new_count} updates | "
-                      f"assets with payout>=70%: {len(high_assets)}/"
-                      f"{len(self.max_profit_by_asset)}")
+            elog.info(f"[depth/change] +{new_count} valid payouts (70-94%) | "
+                      f"assets tracked: {len(self.max_profit_by_asset)}")
 
     def _handle_quotes_stream(self, data: Any) -> None:
         """Handle quotes/stream binary frame: live price ticks.
@@ -2336,33 +2341,40 @@ class MessageInterceptor:
                 if asset:
                     if profit is not None:
                         try:
-                            self.profit_by_asset[asset] = int(profit)
+                            p_int = int(profit)
                         except (ValueError, TypeError):
                             try:
-                                self.profit_by_asset[asset] = int(float(profit))
+                                p_int = int(float(profit))
                             except Exception:
-                                pass
+                                p_int = 0
+                        # FILTER: only accept payout in valid range [70, 94]
+                        if p_int and 70 <= p_int <= 94:
+                            self.profit_by_asset[asset] = p_int
+                            if p_int > self.max_profit_by_asset.get(asset, 0):
+                                self.max_profit_by_asset[asset] = p_int
                     if enabled is not None:
                         self.enabled_by_asset[asset] = enabled
 
             # === Array form: [id, symbol, name, type, ..., payout(5), ..., open(14)] ===
             elif isinstance(item, list) and len(item) >= 6:
                 array_count += 1
-                # item[1] = symbol/asset name
                 asset = item[1] if isinstance(item[1], str) else None
-                # item[5] = payout percentage
                 profit = item[5] if len(item) > 5 else None
-                # item[14] = open flag
                 enabled = bool(item[14]) if len(item) > 14 else None
                 if asset:
                     if profit is not None:
                         try:
-                            self.profit_by_asset[asset] = int(profit)
+                            p_int = int(profit)
                         except (ValueError, TypeError):
                             try:
-                                self.profit_by_asset[asset] = int(float(profit))
+                                p_int = int(float(profit))
                             except Exception:
-                                pass
+                                p_int = 0
+                        # FILTER: only accept payout in valid range [70, 94]
+                        if p_int and 70 <= p_int <= 94:
+                            self.profit_by_asset[asset] = p_int
+                            if p_int > self.max_profit_by_asset.get(asset, 0):
+                                self.max_profit_by_asset[asset] = p_int
                     if enabled is not None:
                         self.enabled_by_asset[asset] = enabled
 
