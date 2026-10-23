@@ -1875,6 +1875,8 @@ class MessageInterceptor:
         self._original_wss_on_message = None  # WebSocketApp callback
         self._ws_client = None
         self._expecting_instruments_binary = False
+        self._expecting_depth_change_binary = False
+        self._expecting_quotes_stream_binary = False
         self._temp_status_instruments = ""
         self._temp_status_history = ""  # tracks which asset we're awaiting
 
@@ -1967,16 +1969,24 @@ class MessageInterceptor:
             self._try_capture_binary(bytes(msg))
         else:
             text = msg if isinstance(msg, str) else msg.decode("utf-8", errors="ignore")
-            # Detect instruments/list announcement
-            if "_placeholder" in text and "instruments/list" in text:
-                if not self._expecting_instruments_binary:
-                    self._expecting_instruments_binary = True
-                    elog.info("[interceptor] received 451-['instruments/list',{...}] announcement; "
-                              "expecting binary frame next")
-                self._temp_status_instruments = text
-            # Detect history/load announcement (response with binary attachment)
-            elif "_placeholder" in text and ("history/list" in text or "history/load" in text):
-                self._temp_status_history = text
+            # Detect ANY _placeholder announcement — track which type of
+            # binary frame is coming next. The Quotex server sends:
+            #   451-["instruments/list",{...}]     → instruments list (profit %)
+            #   451-["depth/change",{...}]          → payout % per asset
+            #   451-["quotes/stream",{...}]         → live price ticks
+            #   451-["history/list/v2",{...}]       → historical candles (ticks)
+            if "_placeholder" in text:
+                if "instruments/list" in text:
+                    if not self._expecting_instruments_binary:
+                        self._expecting_instruments_binary = True
+                        elog.info("[interceptor] received 451-['instruments/list',{...}] announcement")
+                    self._temp_status_instruments = text
+                elif "depth/change" in text:
+                    self._expecting_depth_change_binary = True
+                elif "quotes/stream" in text:
+                    self._expecting_quotes_stream_binary = True
+                elif "history/list" in text or "history/load" in text:
+                    self._temp_status_history = text
             # Try to extract live ticks from EVERY text frame (not just '42'-prefixed)
             self._try_extract_ticks_from_text(text)
 
@@ -2057,19 +2067,82 @@ class MessageInterceptor:
                            f"hex: {preview_hex}")
             return
 
-        # Route the decoded payload
-        # Case A: instruments/list (expected or auto-detected)
+        # Route the decoded payload based on what we're expecting.
+        # The Quotex server sends binary frames in response to text
+        # announcements — we track the announcement type in the text handler.
+
+        # Case A: depth/change → payout % per asset
+        # Format: [["EURUSD_otc",95], ["USDARS_otc",92], ...]
+        if self._expecting_depth_change_binary:
+            self._expecting_depth_change_binary = False
+            self._handle_depth_change(decoded)
+            return
+
+        # Case B: quotes/stream → live price ticks
+        # Format: [["USDARS_otc",1792778133.816,1621.74,1], ...]
+        if self._expecting_quotes_stream_binary:
+            self._expecting_quotes_stream_binary = False
+            self._handle_quotes_stream(decoded)
+            return
+
+        # Case C: instruments/list → profit % + enabled status (full list)
         if self._expecting_instruments_binary or self._looks_like_instruments(decoded):
             self._handle_instruments(decoded, decode_strategy, len(data))
             self._expecting_instruments_binary = False
             self._temp_status_instruments = ""
             return
 
-        # Case B: historical candles (history/load response)
+        # Case D: historical candles (history/list/v2 response)
+        # Format: {"asset":"BRLUSD_otc","period":60,"history":[[ts,price,type],...]}
         if self._temp_status_history or self._looks_like_history(decoded):
             self._handle_history(decoded)
             self._temp_status_history = ""
             return
+
+    def _handle_depth_change(self, data: Any) -> None:
+        """Handle depth/change binary frame: payout % per asset.
+
+        Format: [["EURUSD_otc",95], ["USDARS_otc",92], ...]
+        Each entry: [asset_name, payout_percent]
+        """
+        if not isinstance(data, list):
+            return
+        new_count = 0
+        for item in data:
+            if isinstance(item, list) and len(item) >= 2:
+                asset = item[0]
+                payout = item[1]
+                if isinstance(asset, str) and isinstance(payout, (int, float)):
+                    self.profit_by_asset[asset] = int(payout)
+                    # Assume enabled if we got a payout
+                    if asset not in self.enabled_by_asset:
+                        self.enabled_by_asset[asset] = True
+                    new_count += 1
+        if new_count > 0 and DEBUG_WS_TRAFFIC:
+            elog.info(f"[depth/change] captured payout for {new_count} assets "
+                      f"(total: {len(self.profit_by_asset)})")
+
+    def _handle_quotes_stream(self, data: Any) -> None:
+        """Handle quotes/stream binary frame: live price ticks.
+
+        Format: [["USDARS_otc",1792778133.816,1621.74,1], ...]
+        Each entry: [asset_name, timestamp, price, direction(0/1)]
+        """
+        if not isinstance(data, list):
+            return
+        new_count = 0
+        for tick in data:
+            if isinstance(tick, list) and len(tick) >= 3:
+                asset = tick[0]
+                price = tick[2]
+                if isinstance(asset, str) and isinstance(price, (int, float)):
+                    self.live_prices[asset] = float(price)
+                    self.live_ticks_seen[asset] += 1
+                    self.last_tick_at[asset] = time.time()
+                    new_count += 1
+        if new_count > 0 and DEBUG_WS_TRAFFIC:
+            elog.debug(f"[quotes/stream] captured {new_count} new ticks "
+                       f"(total assets: {len(self.live_prices)})")
 
     @staticmethod
     def _looks_like_instruments(data: Any) -> bool:
