@@ -1760,7 +1760,7 @@ class Spinner:
 # ============================================================================
 # SECTION 6: CONFIGURATION
 # ============================================================================
-TARGET_CANDLE_COUNT = 500
+TARGET_CANDLE_COUNT = 150          # was 500 — reduced per user request for faster fetch
 TIMEFRAME_DEFAULT = 1
 GAP_FILL_MAX_SLOTS = 1440
 
@@ -2890,24 +2890,23 @@ class CandleFetcher:
 
         # === Calculate MINIMUM seconds needed for target_count candles ===
         # +20% buffer to ensure enough after dedup
-        # MINIMUM 1 day (86400s) — Quotex may not serve shorter history
+        # NO minimum 1 day — Quotex accepts shorter requests after the
+        # interceptor fix (forwarding history binary frames to original handler).
         total_seconds_needed = target_count * period_seconds
         amount_of_seconds = int(total_seconds_needed * 1.2)
-        MIN_HISTORY_SECONDS = 86400  # 1 day minimum
-        if amount_of_seconds < MIN_HISTORY_SECONDS:
-            amount_of_seconds = MIN_HISTORY_SECONDS
-
-        # Timeout: 60s minimum, +60s per day
+        # For display: convert to days/hours
         days_float = amount_of_seconds / 86400
-        timeout = max(60, int(days_float * 60))
-
-        print(f"\n  {paint_bold('Fetching ', C2.BRIGHT_CYAN)}"
-              f"{paint_bold(f'{target_count} candles', C2.BRIGHT_GREEN)} — {display_name}")
         if days_float >= 1:
             duration_str = f"{days_float:.2f} day(s)"
         else:
             hours_float = amount_of_seconds / 3600
             duration_str = f"{hours_float:.1f} hour(s)"
+
+        # Timeout: 60s minimum, +1s per 1000 seconds of history
+        timeout = max(60, amount_of_seconds // 1000)
+
+        print(f"\n  {paint_bold('Fetching ', C2.BRIGHT_CYAN)}"
+              f"{paint_bold(f'{target_count} candles', C2.BRIGHT_GREEN)} — {display_name}")
         expected_candles = amount_of_seconds // period_seconds
         elog.info(f"Requesting {duration_str} of {asset} history "
                   f"({amount_of_seconds:,}s = ~{expected_candles:,} candles, need {target_count})")
