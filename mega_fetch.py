@@ -2181,22 +2181,18 @@ class MessageInterceptor:
 
         Format: [["EURUSD_otc",95], ["USDARS_otc",92], ...]
 
-        IMPORTANT: The Quotex server sends FLUCTUATING values for the same
-        asset — some are the CALL payout, some are the PUT payout, and some
-        are transitional/garbage values. From the user's observation:
-          - Real payout for OTC pairs is ALWAYS between 70% and 94%
-          - Values > 94% (like 96%, 97%, 98%) are NOT real payouts
-          - Values < 70% (like 4%, 11%, 28%, 44%) are NOT real payouts
+        The Quotex server sends FLUCTUATING values for the same asset:
+          - Some are the CALL payout (high, e.g. 89%)
+          - Some are the PUT payout (low, e.g. 11%)
+          - Some are transitional/garbage values
 
-        Strategy: FILTER OUT any value outside [70, 94].
-        Only accept values in this valid range, then keep the MAX.
+        Strategy: keep ALL values in history, and use the MODE (most common
+        value) as the real payout. The mode is more stable than MAX because
+        it filters out one-off spikes and reflects the most frequently
+        observed value — which is the real payout.
         """
         if not isinstance(data, list):
             return
-
-        # Valid payout range for Quotex OTC pairs (user confirmed)
-        PAYOUT_MIN = 70
-        PAYOUT_MAX = 94
 
         new_count = 0
         for item in data:
@@ -2206,19 +2202,15 @@ class MessageInterceptor:
                 if isinstance(asset, str) and isinstance(payout, (int, float)):
                     payout_int = int(payout)
 
-                    # FILTER: only accept values in the valid payout range
-                    if payout_int < PAYOUT_MIN or payout_int > PAYOUT_MAX:
-                        continue  # skip — not a real payout
-
-                    # Track history for debugging
+                    # Track ALL values (including out-of-range) for mode calculation
                     self.profit_history[asset].append(payout_int)
                     if len(self.profit_history[asset]) > 30:
                         self.profit_history[asset] = self.profit_history[asset][-30:]
 
-                    # Save last valid value
+                    # Save last value (for reference)
                     self.profit_by_asset[asset] = payout_int
 
-                    # Keep MAX of valid values
+                    # Keep MAX (still useful as upper bound)
                     if payout_int > self.max_profit_by_asset.get(asset, 0):
                         self.max_profit_by_asset[asset] = payout_int
 
@@ -2227,8 +2219,7 @@ class MessageInterceptor:
                     new_count += 1
 
         if new_count > 0 and DEBUG_WS_TRAFFIC:
-            high_assets = [(a, p) for a, p in self.max_profit_by_asset.items() if p >= 70]
-            elog.info(f"[depth/change] +{new_count} valid payouts (70-94%) | "
+            elog.info(f"[depth/change] +{new_count} updates | "
                       f"assets tracked: {len(self.max_profit_by_asset)}")
 
     def _handle_quotes_stream(self, data: Any) -> None:
@@ -2513,13 +2504,23 @@ class MessageInterceptor:
 
     # === Public API ===
     def get_profit(self, asset: str) -> Optional[int]:
-        """Return the HIGHEST payout % seen for this asset (the real payout).
+        """Return the MODE (most common value) of payout % for this asset.
 
-        The Quotex server sends fluctuating payout values over time —
-        sometimes 0% or very low values during recalculation. The REAL
-        payout is always the maximum we've ever seen.
+        The Quotex server sends fluctuating payout values — some are CALL
+        payouts (high), some are PUT payouts (low). The MODE is the value
+        that appears most frequently, which is typically the real payout.
+
+        If no history, fall back to MAX.
         """
-        return self.max_profit_by_asset.get(asset)
+        history = self.profit_history.get(asset, [])
+        if not history:
+            return self.max_profit_by_asset.get(asset)
+
+        # Calculate mode
+        from collections import Counter
+        counter = Counter(history)
+        mode_value, mode_count = counter.most_common(1)[0]
+        return mode_value
 
     def get_last_profit(self, asset: str) -> Optional[int]:
         """Return the LAST payout % seen (for debugging)."""
@@ -2950,9 +2951,15 @@ class CandleFetcher:
                     try:
                         wid = int(worker_label.split('-')[1]) if '-' in worker_label else 0
                         if 0 <= wid < FETCH_MAX_WORKERS:
-                            progress_state['worker_candles'][wid] = candles_count
+                            # REPLACE (not accumulate) — each callback gives the
+                            # total candles THIS worker has fetched so far.
+                            # Workers fetch overlapping windows, so accumulation
+                            # would double-count. Use max to track the highest.
+                            if candles_count > progress_state['worker_candles'][wid]:
+                                progress_state['worker_candles'][wid] = candles_count
                     except Exception:
                         pass
+                    # Total = sum of unique candles per worker (approximate)
                     progress_state['candles'] = sum(progress_state['worker_candles'])
                     current_oldest = progress_state['start_ts'] - seconds_done
                     if current_oldest < progress_state['oldest_ts']:
@@ -3000,14 +3007,16 @@ class CandleFetcher:
                     ),
                     timeout=timeout,
                 )
-                # Force a 100% progress print
+                # Force a 100% progress print with ACTUAL count (not inflated)
+                actual_count = len(candles_raw) if candles_raw else 0
                 with progress_state['lock']:
-                    progress_state['candles'] = len(candles_raw) if candles_raw else 0
+                    progress_state['candles'] = actual_count
+                    # Reset worker_candles to actual values (not accumulated sums)
+                    progress_state['worker_candles'] = [actual_count, 0, 0, 0, 0]
                     progress_state['oldest_ts'] = progress_state['target_ts']
                     progress_state['last_print'] = 0
                 if progress:
-                    progress_callback(amount_of_seconds, amount_of_seconds,
-                                      len(candles_raw) if candles_raw else 0, "Worker-0")
+                    progress_callback(amount_of_seconds, amount_of_seconds, actual_count, "Worker-0")
                     print()
             except asyncio.TimeoutError:
                 if progress: print()
