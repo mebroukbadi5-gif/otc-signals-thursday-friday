@@ -2842,13 +2842,18 @@ class CandleFetcher:
               f"{paint_bold(f'{target_count} candles', C2.BRIGHT_GREEN)} — {display_name}")
 
         # === Calculate MINIMUM seconds needed for target_count candles ===
-        # We use SECONDS (not days) for precision:
-        #   - 500 M1 candles = 500 * 60 = 30,000 seconds = ~8.3 hours
-        #   - 500 M5 candles = 500 * 300 = 150,000 seconds = ~1.74 days
-        # +20% buffer to ensure enough after dedup (was 50%, too much).
+        # We use SECONDS for precision, BUT enforce a MINIMUM of 1 day
+        # (86,400 seconds) because Quotex may not serve history shorter
+        # than that — server returned 0 candles when we asked for 10 hours.
+        #
+        # Buffer = +20% to ensure enough after dedup.
         total_seconds_needed = target_count * period_seconds
-        # +20% buffer
         amount_of_seconds = int(total_seconds_needed * 1.2)
+        # Enforce minimum 1 day (Quotex requires it)
+        MIN_HISTORY_SECONDS = 86400  # 1 day
+        if amount_of_seconds < MIN_HISTORY_SECONDS:
+            amount_of_seconds = MIN_HISTORY_SECONDS
+
         # For display: convert to days/hours
         days_float = amount_of_seconds / 86400
         if days_float >= 1:
@@ -2856,8 +2861,9 @@ class CandleFetcher:
         else:
             hours_float = amount_of_seconds / 3600
             duration_str = f"{hours_float:.1f} hour(s)"
-        # Timeout: 30s minimum, +1s per 1000 seconds of history
-        timeout = max(30, amount_of_seconds // 1000)
+
+        # Timeout: 60s minimum, +1s per 1000 seconds of history
+        timeout = max(60, amount_of_seconds // 1000)
         fetch_start = time.time()
 
         expected_candles = amount_of_seconds // period_seconds
