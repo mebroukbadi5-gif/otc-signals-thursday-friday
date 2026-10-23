@@ -2826,12 +2826,11 @@ class CandleFetcher:
                               progress: bool = True) -> List[Dict]:
         """Fetch exactly target_count candles for asset — OTC_canda_ method.
 
-        Calculates the MINIMUM days needed to get target_count candles
-        (instead of requesting 2 days for 500 M1 candles which fetches 2880).
-        For M1 + 500 candles: only ~9 hours needed (0.4 day).
-        For M5 + 500 candles: ~42 hours needed (~2 days).
+        Calculates the MINIMUM seconds needed to get target_count candles
+        (uses SECONDS for precision, not days — no rounding up to full days).
+        For M1 + 500 candles: only 30,000 seconds (~8.3 hours) needed.
+        For M5 + 500 candles: 150,000 seconds (~1.74 days) needed.
         """
-        import math
         period_seconds = int(timeframe_min * 60)
         display_name = f"{asset} (M{timeframe_min})"
         client = self.client_holder.client
@@ -2842,21 +2841,28 @@ class CandleFetcher:
         print(f"\n  {paint_bold('Fetching ', C2.BRIGHT_CYAN)}"
               f"{paint_bold(f'{target_count} candles', C2.BRIGHT_GREEN)} — {display_name}")
 
-        # === Calculate MINIMUM days needed for target_count candles ===
-        # target_count candles * period_seconds = total seconds needed
-        # Convert to days, +50% buffer to ensure enough after dedup.
+        # === Calculate MINIMUM seconds needed for target_count candles ===
+        # We use SECONDS (not days) for precision:
+        #   - 500 M1 candles = 500 * 60 = 30,000 seconds = ~8.3 hours
+        #   - 500 M5 candles = 500 * 300 = 150,000 seconds = ~1.74 days
+        # +20% buffer to ensure enough after dedup (was 50%, too much).
         total_seconds_needed = target_count * period_seconds
-        days_needed_float = total_seconds_needed / 86400
-        # Add 50% buffer (or at least 0.1 day = 2.4h)
-        days_needed = max(1, math.ceil(days_needed_float * 1.5))
-        amount_of_seconds = int(days_needed * 86400)
-        # Timeout: 60s minimum, +30s per day
-        timeout = max(60, days_needed * 30)
+        # +20% buffer
+        amount_of_seconds = int(total_seconds_needed * 1.2)
+        # For display: convert to days/hours
+        days_float = amount_of_seconds / 86400
+        if days_float >= 1:
+            duration_str = f"{days_float:.2f} day(s)"
+        else:
+            hours_float = amount_of_seconds / 3600
+            duration_str = f"{hours_float:.1f} hour(s)"
+        # Timeout: 30s minimum, +1s per 1000 seconds of history
+        timeout = max(30, amount_of_seconds // 1000)
         fetch_start = time.time()
 
-        expected_candles = days_needed * 1440 // timeframe_min
-        elog.info(f"Requesting {days_needed} day(s) of {asset} history "
-                  f"(~{expected_candles:,} candles expected, need {target_count})")
+        expected_candles = amount_of_seconds // period_seconds
+        elog.info(f"Requesting {duration_str} of {asset} history "
+                  f"({amount_of_seconds:,}s = ~{expected_candles:,} candles, need {target_count})")
 
         # === Progress callback (same as OTC_canda_.py) ===
         # Shared progress tracker for all 5 workers
