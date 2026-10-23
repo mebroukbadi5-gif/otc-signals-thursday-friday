@@ -1776,8 +1776,8 @@ RECONNECT_BACKOFF_MAX = 60         # maximum backoff
 LONG_DISCONNECT_THRESHOLD = 3600   # 1 hour — triggers full re-fetch
 
 # Live price settings
-LIVE_PRICE_LISTEN_SECONDS = 5.0    # how long to listen for ticks per asset (was 2)
-LIVE_PRICE_BROADCAST_INTERVAL = 0.5  # render interval for live price table
+LIVE_PRICE_LISTEN_SECONDS = 10.0   # increased from 5 to give more time for data
+LIVE_PRICE_BROADCAST_INTERVAL = 0.5
 
 # DEBUG: when True, every WS message is logged for diagnosis.
 # Disable by setting this to False in production.
@@ -2114,13 +2114,12 @@ class MessageInterceptor:
                 payout = item[1]
                 if isinstance(asset, str) and isinstance(payout, (int, float)):
                     self.profit_by_asset[asset] = int(payout)
-                    # Assume enabled if we got a payout
                     if asset not in self.enabled_by_asset:
                         self.enabled_by_asset[asset] = True
                     new_count += 1
         if new_count > 0 and DEBUG_WS_TRAFFIC:
-            elog.info(f"[depth/change] captured payout for {new_count} assets "
-                      f"(total: {len(self.profit_by_asset)})")
+            elog.info(f"[depth/change] payout captured for {new_count} assets "
+                      f"(total known: {len(self.profit_by_asset)})")
 
     def _handle_quotes_stream(self, data: Any) -> None:
         """Handle quotes/stream binary frame: live price ticks.
@@ -2141,8 +2140,10 @@ class MessageInterceptor:
                     self.last_tick_at[asset] = time.time()
                     new_count += 1
         if new_count > 0 and DEBUG_WS_TRAFFIC:
-            elog.debug(f"[quotes/stream] captured {new_count} new ticks "
-                       f"(total assets: {len(self.live_prices)})")
+            # Show total ticks received across all assets (more meaningful than unique count)
+            total_ticks = sum(self.live_ticks_seen.values())
+            elog.debug(f"[quotes/stream] +{new_count} tick | "
+                       f"total ticks: {total_ticks} | assets tracked: {len(self.live_prices)}")
 
     @staticmethod
     def _looks_like_instruments(data: Any) -> bool:
@@ -3060,11 +3061,32 @@ async def main_async():
     live_sub.subscribe_all(OTC_ASSETS, period=60)
     elog.success(f"Subscribed to live prices for {len(OTC_ASSETS)} OTC pairs")
 
-    # Wait for live prices to arrive
-    elog.info(f"Listening for live prices ({LIVE_PRICE_LISTEN_SECONDS}s)...")
-    await asyncio.sleep(LIVE_PRICE_LISTEN_SECONDS)
+    # Wait for live prices AND payout data to arrive.
+    # We poll every 0.5s up to LIVE_PRICE_LISTEN_SECONDS, and also accept
+    # early exit if we've collected payout for at least 10 assets AND
+    # live price for at least 10 assets.
+    elog.info(f"Listening for live prices + payout data (up to {LIVE_PRICE_LISTEN_SECONDS}s)...")
+    deadline = time.time() + LIVE_PRICE_LISTEN_SECONDS
+    while time.time() < deadline:
+        n_profit = len(interceptor.profit_by_asset)
+        n_live = len(interceptor.live_prices)
+        if n_profit >= 10 and n_live >= 10:
+            elog.success(f"Got data: {n_profit} payout%, {n_live} live prices — "
+                         f"stopping early.")
+            break
+        await asyncio.sleep(0.5)
 
-    # Print summary table (profit % shows only if auto-pushed by server)
+    n_profit = len(interceptor.profit_by_asset)
+    n_live = len(interceptor.live_prices)
+    elog.info(f"Collected: {n_profit} payout% entries, {n_live} live prices")
+
+    if n_profit == 0:
+        elog.warn("No payout data received. Server may not have pushed depth/change yet.")
+        elog.warn("Will continue anyway — payout % column will show N/A.")
+    if n_live == 0:
+        elog.warn("No live prices received. Market may be closed or subscription failed.")
+
+    # Print summary table (now with real data)
     InstrumentsFetcher(holder, interceptor).print_summary(OTC_ASSETS)
 
     # Ask for timeframe
