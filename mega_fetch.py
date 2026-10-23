@@ -52,6 +52,9 @@ import ssl
 import json
 import time
 import random
+import re
+import shutil
+import logging
 import asyncio
 import threading
 import traceback
@@ -65,25 +68,1468 @@ from enum import IntEnum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 
+# Third-party dependencies (required by the Quotex connection engine)
+import certifi
+import requests
+import websocket
+from requests import Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+
+try:
+    import orjson as _orjson
+    HAS_ORJSON = True
+except ImportError:
+    _orjson = None
+    HAS_ORJSON = False
+
 # ============================================================================
-# SECTION 1: REUSE QUOTEX CORE FROM OTC_canda_.py
+
 # ============================================================================
-sys.path.insert(0, str(Path(__file__).parent))
-from OTC_canda_ import (
-    Quotex,
-    connect_quotex,
-    load_credentials,
-    save_credentials,
-    purge_old_session,
-    logmsg,
-    log_exception,
-    Colors,
-    CANDLES_DIR,
-    CREDENTIALS_FILE,
+# SECTION 1: QUOTEX CONNECTION ENGINE (embedded — no external file needed)
+# ============================================================================
+# This section contains the FULL Quotex connection engine, ported verbatim
+# from OTC_canda_.py. It includes:
+#   - SSL setup + logging
+#   - Event-driven wait primitives
+#   - HTTP Navigator (CipherSuiteAdapter, Browser)
+#   - HTTP Login & Settings
+#   - WebSocket Client & State
+#   - Quotex API Core (QuotexAPI class)
+#   - Candle parsing helpers
+#   - Quotex stable API class (with get_historical_candles)
+#   - Helper utilities (logmsg, Colors, credentials, save_candles_to_json)
+#   - keepalive_loop + auto_reconnect_loop + connect_quotex
+#
+# By embedding this code directly, mega_fetch.py is now a SINGLE-FILE solution
+# that does NOT require OTC_canda_.py to be present in the same folder.
+
+# SECTION 1: LOGGING & SSL SETUP
+# ==============================================================================
+def _prepare_logging():
+    logger = logging.getLogger(__name__)
+    logger.addHandler(logging.NullHandler())
+    websocket_logger = logging.getLogger("websocket")
+    websocket_logger.setLevel(logging.INFO)
+    websocket_logger.addHandler(logging.NullHandler())
+
+_prepare_logging()
+logger = logging.getLogger(__name__)
+
+cert_path = certifi.where()
+os.environ['SSL_CERT_FILE'] = cert_path
+os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = cert_path
+cacert = os.environ.get('WEBSOCKET_CLIENT_CA_BUNDLE')
+
+ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+ssl_context.load_verify_locations(cert_path)
+
+
+# ==============================================================================
+# SECTION 1.5: EVENT-DRIVEN WAIT PRIMITIVES
+# ==============================================================================
+async def wait_until(predicate: Callable[[], bool], *, timeout: float = 10.0,
+                      poll_interval: float = 0.05) -> None:
+    """يستدعي predicate() كل poll_interval ثانية حتى يُعيد True أو ينتهي timeout."""
+    async def _loop():
+        while not predicate():
+            await asyncio.sleep(poll_interval)
+    await asyncio.wait_for(_loop(), timeout=timeout)
+
+
+async def wait_for_first_event(*events: asyncio.Event, timeout: float = 10.0) -> int:
+    """ينتظر أول event يُطلق من القائمة ويعيد indexه. يطلق TimeoutError عند المهلة."""
+    if not events:
+        raise ValueError("wait_for_first_event requires at least one event")
+    tasks = [asyncio.ensure_future(e.wait()) for e in events]
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=timeout,
+                                           return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        for i, t in enumerate(tasks):
+            if t in done and t.result() and not t.cancelled():
+                return i
+        raise asyncio.TimeoutError()
+    except asyncio.CancelledError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        raise
+
+
+def _schedule_event_set(event: Optional[asyncio.Event],
+                        loop: Optional[asyncio.AbstractEventLoop]) -> None:
+    if event is None or loop is None:
+        return
+    try:
+        if not loop.is_closed() and loop.is_running():
+            loop.call_soon_threadsafe(event.set)
+    except RuntimeError:
+        pass
+
+
+# ==============================================================================
+# SECTION 2: CONSTANTS & SESSION
+# ==============================================================================
+USER_AGENT = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
+base_dir = Path.cwd()
+session_lock = threading.Lock()
+
+
+def resource_path(relative_path: str) -> Path:
+    global base_dir
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_dir = Path(sys._MEIPASS)
+    return base_dir / relative_path
+
+
+def load_session(email: str, user_agent: str = None) -> dict:
+    if user_agent is None:
+        try:
+            user_agent = UserAgent().random
+        except Exception:
+            user_agent = USER_AGENT
+    output_file = Path(resource_path("session.json"))
+    with session_lock:
+        all_sessions = {}
+        if output_file.exists():
+            try:
+                all_sessions = json.loads(output_file.read_text())
+            except json.JSONDecodeError:
+                pass
+        else:
+            output_file.parent.mkdir(exist_ok=True, parents=True)
+        if email not in all_sessions:
+            all_sessions[email] = {"cookies": None, "token": None, "user_agent": user_agent}
+        output_file.write_text(json.dumps(all_sessions, indent=4))
+        return all_sessions.get(email)
+
+
+def update_session(email: str, d: dict) -> dict:
+    output_file = Path(resource_path("session.json"))
+    with session_lock:
+        current_sessions = {}
+        if output_file.exists():
+            try:
+                current_sessions = json.loads(output_file.read_text())
+            except json.JSONDecodeError:
+                pass
+        else:
+            output_file.parent.mkdir(exist_ok=True, parents=True)
+        current_sessions[email] = d
+        output_file.write_text(json.dumps(current_sessions, indent=4))
+        return current_sessions.get(email)
+
+
+# ==============================================================================
+# SECTION 3: HTTP NAVIGATOR (PROVEN WORKING METHOD)
+# ==============================================================================
+retry_strategy = Retry(
+    total=3, backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504, 104],
+    allowed_methods=["HEAD", "POST", "PUT", "GET", "OPTIONS"],
 )
 
 
+class CipherSuiteAdapter(HTTPAdapter):
+    __attrs__ = ['ssl_context', 'max_retries', 'config', '_pool_connections',
+                 '_pool_maxsize', '_pool_block', 'source_address']
+
+    def __init__(self, *args, **kwargs):
+        self.ssl_context = kwargs.pop('ssl_context', None)
+        self.cipherSuite = kwargs.pop('cipherSuite',
+            'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:'
+            'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:'
+            'ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:'
+            'DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384')
+        self.source_address = kwargs.pop('source_address', None)
+        self.server_hostname = kwargs.pop('server_hostname', None)
+        self.ecdhCurve = kwargs.pop('ecdhCurve', 'prime256v1')
+        if not self.ssl_context:
+            self.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            self.ssl_context.orig_wrap_socket = self.ssl_context.wrap_socket
+            self.ssl_context.wrap_socket = self.wrap_socket
+        if self.server_hostname:
+            self.ssl_context.server_hostname = self.server_hostname
+        if self.cipherSuite:
+            self.ssl_context.set_ciphers(self.cipherSuite)
+            self.ssl_context.set_ecdh_curve(self.ecdhCurve)
+            self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            self.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
+        super().__init__(**kwargs)
+
+    def wrap_socket(self, *args, **kwargs):
+        if hasattr(self.ssl_context, 'server_hostname') and self.ssl_context.server_hostname:
+            kwargs['server_hostname'] = self.ssl_context.server_hostname
+            self.ssl_context.check_hostname = False
+        else:
+            self.ssl_context.check_hostname = True
+        return self.ssl_context.orig_wrap_socket(*args, **kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['ssl_context'] = self.ssl_context
+        kwargs['source_address'] = self.source_address
+        return super().init_poolmanager(*args, **kwargs)
+
+
+class Browser(Session):
+    def __init__(self, *args, **kwargs):
+        self.response = None
+        self.default_headers = None
+        self.ecdhCurve = kwargs.pop('ecdhCurve', 'prime256v1')
+        self.cipherSuite = kwargs.pop('cipherSuite',
+            'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:'
+            'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:'
+            'ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:'
+            'DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384')
+        self.source_address = kwargs.pop('source_address', None)
+        self.server_hostname = kwargs.pop('server_hostname', None)
+        # استخرج proxies قبل super().__init__ (الذي يعيد ضبط self.proxies إلى {})
+        _proxies = kwargs.pop('proxies', None)
+        super().__init__(*args, **kwargs)
+        # اضبط proxies بعد super().__init__ حتى لا تُكتب فوقها بـ {}
+        # هذا يحل المشكلة: send_request يفحص self.proxies لكن Session.__init__ يفرغها
+        self.proxies = _proxies
+        self.headers.update(self.get_headers())
+        self.mount('https://', CipherSuiteAdapter(
+            ecdhCurve=self.ecdhCurve, cipherSuite=self.cipherSuite,
+            server_hostname=self.server_hostname, source_address=self.source_address,
+            ssl_context=ssl_context, max_retries=retry_strategy))
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb): self.close()
+    async def __aenter__(self): return self
+    async def __aexit__(self, exc_type, exc_val, exc_tb): self.__exit__(exc_type, exc_val, exc_tb)
+
+    def get_headers(self):
+        self.default_headers = {"User-Agent": USER_AGENT}
+        return self.default_headers
+
+    def set_headers(self, headers=None):
+        self.headers.update(self.default_headers)
+        if headers: self.headers.update(headers)
+
+    def get_cookies(self):
+        return '; '.join(f'{i.name}={i.value}' for i in self.cookies)
+
+    def get_soup(self):
+        if self.response and not self.response.ok:
+            raise RuntimeError(self.response.reason)
+        return BeautifulSoup(self.response.content, "html.parser")
+
+    def send_request(self, method, url, headers=None, **kwargs):
+        merged_headers = self.headers.copy()
+        if headers: merged_headers.update(headers)
+        if self.proxies: kwargs['proxies'] = self.proxies
+        self.response = self.request(method, url, headers=merged_headers, **kwargs)
+        return self.response
+
+
+# ==============================================================================
+# SECTION 4: HTTP LOGIN & SETTINGS
+# ==============================================================================
+class Login(Browser):
+    url = ""
+    cookies = None
+    ssid = None
+    base_url = 'quotex.com'  # <--- تم التحديث هنا
+    https_base_url = f'https://{base_url}'
+
+    def __init__(self, api, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.api = api
+        self.headers = self.get_headers()
+        self.full_url = f"{self.https_base_url}/{api.lang}"
+
+    def get_token(self):
+        self.headers["Connection"] = "keep-alive"
+        self.headers["Accept-Encoding"] = "gzip, deflate, br"
+        self.headers["Accept-Language"] = "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3"
+        self.headers["Accept"] = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                                  "image/avif,image/webp,*/*;q=0.8")
+        self.headers["Referer"] = f"{self.full_url}/sign-in"
+        self.headers["Upgrade-Insecure-Requests"] = "1"
+        self.headers["Sec-Ch-Ua-Mobile"] = "?0"
+        self.headers["Sec-Ch-Ua-Platform"] = '"Linux"'
+        self.headers["Sec-Fetch-Site"] = "same-origin"
+        self.headers["Sec-Fetch-User"] = "?1"
+        self.headers["Sec-Fetch-Dest"] = "document"
+        self.headers["Sec-Fetch-Mode"] = "navigate"
+        self.headers["Dnt"] = "1"
+        self.send_request("GET", f"{self.full_url}/sign-in/modal/")
+        html = self.get_soup()
+        match = html.find("input", {"name": "_token"})
+        return None if not match else match.get("value")
+
+    async def awaiting_pin(self, data, input_message):
+        self.headers["Content-Type"] = "application/x-www-form-urlencoded"
+        self.headers["Referer"] = f"{self.full_url}/sign-in/modal"
+        data["keep_code"] = 1
+        try:
+            code = input(input_message)
+            if not code.isdigit():
+                print("Please enter a valid code.")
+                await self.awaiting_pin(data, input_message)
+            data["code"] = code
+        except KeyboardInterrupt:
+            print("\nClosing program.")
+            sys.exit()
+        await asyncio.sleep(1)
+        self.send_request(method="POST", url=f"{self.full_url}/sign-in/modal", data=data)
+
+    def get_profile(self):
+        self.response = self.send_request(method="GET", url=f"{self.full_url}/trade")
+        if self.response:
+            script = self.get_soup().find_all("script", {"type": "text/javascript"})
+            script = script[0].get_text() if script else "{}"
+            match = script.strip().replace(";", "").replace("window.settings = ", "")
+            self.cookies = self.get_cookies()
+            try:
+                settings_dict = json.loads(match)
+                self.ssid = settings_dict.get("token")
+            except json.JSONDecodeError:
+                self.ssid = None
+            self.api.session_data["cookies"] = self.cookies
+            self.api.session_data["token"] = self.ssid
+            self.api.session_data["user_agent"] = self.headers["User-Agent"]
+            update_session(self.api.username, self.api.session_data)
+            return self.response, settings_dict if self.ssid else None
+        return None, None
+
+    async def _post(self, data):
+        self.response = self.send_request(method="POST", url=f"{self.full_url}/sign-in/", data=data)
+        required_keep_code = self.get_soup().find("input", {"name": "keep_code"})
+        if required_keep_code:
+            auth_body = self.get_soup().find("main", {"class": "auth__body"})
+            input_message = (f'{auth_body.find("p").text}: '
+                             if auth_body.find("p")
+                             else "Enter the PIN code sent to your email: ")
+            await self.awaiting_pin(data, input_message)
+            await asyncio.sleep(1)
+            return self.success_login()
+        return self.success_login()
+
+    def success_login(self):
+        if "trade" in str(self.response.url):
+            return True, "Login successful."
+        soup = self.get_soup()
+        not_available = soup.select_one("#tab-1 > div > div.modal-sign__not-avalible__title")
+        if not_available:
+            return False, f"Service unavailable: {not_available.get_text(strip=True)}"
+        error = soup.select_one("#tab-1 form > div:nth-child(2) > div")
+        msg = error.get_text(strip=True) if error else "Unknown error"
+        return False, f"Login failed. {msg}"
+
+    async def __call__(self, username, password, user_data_dir=None):
+        data = {"_token": self.get_token(), "email": username,
+                "password": password, "remember": 1}
+        status, msg = await self._post(data)
+        if status:
+            self.get_profile()
+        return status, msg
+
+
+class Settings(Browser):
+    def __init__(self, api):
+        # مرّر proxies من api إلى Settings
+        proxies_dict = api._normalize_proxies(api.proxies) if hasattr(api, '_normalize_proxies') else None
+        super().__init__(proxies=proxies_dict)
+        self.set_headers()
+        self.api = api
+        self.headers = self.get_headers()
+
+    def get_settings(self):
+        self.headers["content-type"] = "application/json"
+        self.headers["referer"] = f"{self.api.https_url}/{self.api.lang}/trade"
+        self.headers["cookie"] = self.api.session_data.get("cookies", "")
+        self.headers["user-agent"] = self.api.session_data.get("user_agent", "")
+        response = self.send_request("GET", f"{self.api.https_url}/api/v1/cabinets/digest")
+        return response.json()
+
+
+# ==============================================================================
+# SECTION 5: WEBSOCKET CLIENT & STATE
+# ==============================================================================
+class WebsocketStatus(IntEnum):
+    DISCONNECTED = 0
+    CONNECTED = 1
+    CONNECTING = 2
+    ERROR = -1
+
+
+class AuthStatus(IntEnum):
+    NOT_AUTHENTICATED = 0
+    AUTHENTICATING = 1
+    AUTHENTICATED = 2
+    FAILED = -1
+
+
+class ConnectionState:
+    def __init__(self):
+        self.SSID = None
+        self.status = WebsocketStatus.DISCONNECTED
+        self.auth_status = AuthStatus.NOT_AUTHENTICATED
+        self.ssl_Mutual_exclusion = False
+        self.ssl_Mutual_exclusion_write = False
+        self.check_rejected_connection = False
+        self.check_accepted_connection = False
+        self.check_websocket_if_error = False
+        self.check_websocket_if_connect = None
+        self.websocket_error_reason = None
+        # EVENT-DRIVEN: تُهيّأ lazily من async context
+        self.ws_connected_event: Optional[asyncio.Event] = None
+        self.ws_closed_event: Optional[asyncio.Event] = None
+        self.auth_accepted_event: Optional[asyncio.Event] = None
+        self.auth_rejected_event: Optional[asyncio.Event] = None
+        self.ws_error_event: Optional[asyncio.Event] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def init_events(self) -> None:
+        if self.ws_connected_event is None: self.ws_connected_event = asyncio.Event()
+        if self.ws_closed_event is None: self.ws_closed_event = asyncio.Event()
+        if self.auth_accepted_event is None: self.auth_accepted_event = asyncio.Event()
+        if self.auth_rejected_event is None: self.auth_rejected_event = asyncio.Event()
+        if self.ws_error_event is None: self.ws_error_event = asyncio.Event()
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+
+    def reset_events(self) -> None:
+        for ev in (self.ws_connected_event, self.ws_closed_event,
+                   self.auth_accepted_event, self.auth_rejected_event,
+                   self.ws_error_event):
+            if ev is not None:
+                ev.clear()
+
+    def signal_ws_connected(self): _schedule_event_set(self.ws_connected_event, self._loop)
+    def signal_ws_closed(self): _schedule_event_set(self.ws_closed_event, self._loop)
+    def signal_auth_accepted(self): _schedule_event_set(self.auth_accepted_event, self._loop)
+    def signal_auth_rejected(self): _schedule_event_set(self.auth_rejected_event, self._loop)
+    def signal_ws_error(self): _schedule_event_set(self.ws_error_event, self._loop)
+
+
+class WebsocketClient:
+    def __init__(self, api):
+        self.api = api
+        self.state = api.state
+        self.headers = {
+            "User-Agent": self.api.session_data.get("user_agent", USER_AGENT),
+            "Origin": self.api.https_url,
+            "Host": f"ws2.{self.api.host}",
+        }
+        self.wss = websocket.WebSocketApp(
+            self.api.wss_url,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close,
+            on_open=self.on_open,
+            on_ping=self.on_ping,
+            on_pong=self.on_pong,
+            header=self.headers,
+            cookie=self.api.session_data.get("cookies"),
+        )
+
+    def on_message(self, wss, msg):
+        self.state.ssl_Mutual_exclusion = True
+        try:
+            if self.api is not None:
+                self.api.last_message_at = time.time()
+            msg_str = msg.decode("utf-8", errors="ignore") if isinstance(msg, bytes) else str(msg)
+
+            if msg_str == "2":
+                try:
+                    self.wss.send("3")
+                except Exception:
+                    pass
+                self.state.ssl_Mutual_exclusion = False
+                return
+            if msg_str == "3":
+                self.state.ssl_Mutual_exclusion = False
+                return
+
+            if "authorization/reject" in msg_str:
+                logger.warning("Token rejected.")
+                self.state.check_rejected_connection = True
+                self.state.auth_status = AuthStatus.FAILED
+                self.state.signal_auth_rejected()
+            elif "s_authorization" in msg_str:
+                self.state.check_accepted_connection = True
+                self.state.check_rejected_connection = False
+                self.state.auth_status = AuthStatus.AUTHENTICATED
+                self.state.status = WebsocketStatus.CONNECTED
+                self.state.signal_auth_accepted()
+
+            message = None
+            if len(msg_str) > 1 and msg_str[1] in ('[', '{'):
+                try:
+                    message = json.loads(msg_str[1:])
+                except Exception:
+                    pass
+
+            if message is not None:
+                self._process_message_and_raise_events(message)
+
+            if str(msg_str) == "41":
+                self.state.check_websocket_if_connect = 0
+        except Exception as e:
+            logger.error("Unhandled error in on_message: %s", e)
+        self.state.ssl_Mutual_exclusion = False
+
+    def _process_message_and_raise_events(self, message):
+        try:
+            loop = self.api._async_loop
+            if loop is None or not loop.is_running():
+                return
+            if isinstance(message, dict):
+                asset = message.get("asset")
+                if asset and (message.get("candles") or message.get("data") or message.get("history")):
+                    self.api.candle_v2_data[asset] = message
+                    self.api.candles.candles_data = (message.get("candles")
+                                                    or message.get("data")
+                                                    or message.get("history"))
+                    asyncio.run_coroutine_threadsafe(
+                        self.api.event_registry.set_event(f'candles_ready_{asset}', message),
+                        loop)
+                    index = message.get("index")
+                    if index is not None:
+                        asyncio.run_coroutine_threadsafe(
+                            self.api.event_registry.set_event(f'candles_ready_{asset}_{index}', message),
+                            loop)
+            if isinstance(message, dict) and (message.get("liveBalance") or message.get("demoBalance")):
+                self.api.account_balance = message
+        except Exception as e:
+            logger.debug(f"Error processing message: {e}")
+
+    def on_error(self, wss, error):
+        logger.error(error)
+        self.state.websocket_error_reason = str(error)
+        self.state.check_websocket_if_error = True
+        self.state.status = WebsocketStatus.ERROR
+        self.state.check_accepted_connection = False
+        self.state.signal_ws_error()
+
+    def on_open(self, wss):
+        logger.info("Websocket client connected.")
+        self.state.check_websocket_if_connect = 1
+        self.state.status = WebsocketStatus.CONNECTED
+        self.state.signal_ws_connected()
+        asset_name = self.api.current_asset or "EURUSD_otc"
+        period = self.api.current_period or 60
+        self.wss.send('42["tick"]')
+        self.wss.send('42["indicator/list"]')
+        self.wss.send('42["drawing/load"]')
+        self.wss.send('42["pending/list"]')
+        self.wss.send(f'42["instruments/update",{{"asset":"{asset_name}","period":{period}}}]')
+        self.wss.send(f'42["depth/follow","{asset_name}"]')
+        self.wss.send('42["chart_notification/get"]')
+        self.wss.send('42["instruments/get"]')
+        self.wss.send('42["tick"]')
+
+    def on_close(self, wss, close_status_code, close_msg):
+        logger.info("Websocket connection closed.")
+        self.state.check_websocket_if_connect = 0
+        self.state.status = WebsocketStatus.DISCONNECTED
+        self.state.check_accepted_connection = False
+        self.state.signal_ws_closed()
+
+    def on_ping(self, wss, ping_msg): pass
+    def on_pong(self, wss, pong_msg): pass
+
+
+# ==============================================================================
+# SECTION 6: QUOTEX API CORE
+# ==============================================================================
+class CandlesObj:
+    def __init__(self): self.__candles_data = None
+    @property
+    def candles_data(self): return self.__candles_data
+    @candles_data.setter
+    def candles_data(self, candles_data): self.__candles_data = candles_data
+
+
+class EventRegistry:
+    def __init__(self):
+        self._events: Dict[str, asyncio.Event] = {}
+        self._data: Dict[str, Any] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_event(self, key: str) -> asyncio.Event:
+        async with self._lock:
+            if key not in self._events:
+                self._events[key] = asyncio.Event()
+            return self._events[key]
+
+    async def set_event(self, key: str, data: Any = None):
+        async with self._lock:
+            if key not in self._events:
+                self._events[key] = asyncio.Event()
+            self._data[key] = data
+            self._events[key].set()
+
+    async def wait_event(self, key: str, timeout: float = 30.0) -> Any:
+        event = await self.get_event(key)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return self._data.get(key)
+        except asyncio.TimeoutError:
+            return None
+
+    async def clear_event(self, key: str):
+        async with self._lock:
+            if key in self._events:
+                self._events[key].clear()
+            if key in self._data:
+                del self._data[key]
+
+
+class QuotexAPI:
+    def __init__(self, host, username, password, lang, proxies=None, user_data_dir="."):
+        self.state = ConnectionState()
+        self.trace_ws = False
+        self.current_asset = None
+        self.current_period = None
+        self.account_balance = None
+        self.account_type = 1
+        self.instruments = None
+        self.host = host
+        self.https_url = f"https://{host}"
+        self.wss_url = f"wss://ws2.{host}/socket.io/?EIO=3&transport=websocket"
+        self.websocket_thread = None
+        self.websocket_client = None
+        self.username = username
+        self.password = password
+        self.proxies = proxies
+        self.lang = lang
+        self.user_data_dir = user_data_dir
+        self.session_data = {}
+        # مرّر proxies إلى Browser حتى يستخدمها HTTP (Login + Settings)
+        # إذا proxy هو "http://1.2.3.4:8080" نُحوّله إلى dict متوافق مع requests
+        proxies_dict = self._normalize_proxies(proxies)
+        self.browser = Browser(proxies=proxies_dict)
+        self.browser.set_headers()
+        self.settings = Settings(self)
+        self.settings.proxies = proxies_dict  # تأكد أن Settings أيضاً يستخدم البروكسي
+        self.candles = CandlesObj()
+        self.candle_v2_data = {}
+        self.realtime_price = defaultdict(list)
+        self.event_registry = EventRegistry()
+        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
+        self.last_message_at: float = time.time()
+
+    @staticmethod
+    def _normalize_proxies(proxies) -> Optional[dict]:
+        """يحوّل proxy string (أو dict) إلى dict صيغة requests."""
+        if not proxies:
+            return None
+        if isinstance(proxies, dict):
+            return proxies
+        if isinstance(proxies, str):
+            # صيغة مثل "http://1.2.3.4:8080" أو "socks5://1.2.3.4:1080"
+            return {"http": proxies, "https": proxies}
+        return None
+
+    @property
+    def login(self):
+        # مرّر proxies إلى Login حتى يستخدمها طلبات HTTP لتسجيل الدخول
+        return Login(self, proxies=self._normalize_proxies(self.proxies))
+
+    def send_websocket_request(self, data, no_force_send=True):
+        if no_force_send:
+            deadline = time.time() + 5.0
+            while (self.state.ssl_Mutual_exclusion or self.state.ssl_Mutual_exclusion_write):
+                if time.time() > deadline:
+                    break
+                time.sleep(0.001)
+        self.state.ssl_Mutual_exclusion_write = True
+        try:
+            if self.websocket_client and self.websocket_client.wss:
+                self.websocket_client.wss.send(data)
+        finally:
+            self.state.ssl_Mutual_exclusion_write = False
+
+    def subscribe_realtime_candle(self, asset, period):
+        self.realtime_price[asset] = []
+        data = f'42["instruments/update", {json.dumps({"asset": asset, "period": period})}]'
+        return self.send_websocket_request(data)
+
+    def follow_candle(self, asset):
+        return self.send_websocket_request(f'42["depth/follow", {json.dumps(asset)}]')
+
+    def chart_notification(self, asset):
+        return self.send_websocket_request(
+            f'42["chart_notification/get", {json.dumps({"asset": asset, "version": "1.0.0"})}]')
+
+    def get_candles_ws(self, asset, index, time_val, offset, period):
+        payload = {"asset": asset, "index": index, "time": time_val, "offset": offset, "period": period}
+        data = f'42["history/load",{json.dumps(payload)}]'
+        return self.send_websocket_request(data)
+
+    async def authenticate(self):
+        async with self.login as login:
+            status, msg = await login(self.username, self.password, self.user_data_dir)
+        if status:
+            self.state.SSID = self.session_data.get("token")
+        return status, msg
+
+    async def start_websocket(self):
+        self.state.check_websocket_if_connect = None
+        self.state.check_websocket_if_error = False
+        self.state.websocket_error_reason = None
+        self.state.init_events()
+        self.state.reset_events()
+        try:
+            self.state._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.state._loop = None
+
+        if not self.state.SSID:
+            await self.authenticate()
+        self.websocket_client = WebsocketClient(self)
+        payload = {
+            "suppress_origin": True, "ping_interval": 24, "ping_timeout": 20,
+            "ping_payload": "2",
+            "origin": self.https_url, "host": f"ws2.{self.host}",
+            "sslopt": {"check_hostname": True, "cert_reqs": ssl.CERT_REQUIRED,
+                       "ca_certs": cacert, "context": ssl_context},
+        }
+        # مرّر البروكسي إلى WebSocket إذا وُجد
+        proxy_dict = self._normalize_proxies(self.proxies)
+        if proxy_dict:
+            proxy_url = proxy_dict.get("http") or proxy_dict.get("https")
+            if proxy_url:
+                # تحليل "http://host:port" أو "socks5://host:port"
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(proxy_url)
+                    if parsed.hostname and parsed.port:
+                        payload["http_proxy_host"] = parsed.hostname
+                        payload["http_proxy_port"] = parsed.port
+                        if parsed.scheme.startswith("socks"):
+                            payload["http_proxy_auth_timeout"] = 30
+                except Exception:
+                    pass
+        if platform.system() == "Linux":
+            payload["sslopt"]["ssl_version"] = ssl.PROTOCOL_TLS
+        self.websocket_thread = threading.Thread(
+            target=self.websocket_client.wss.run_forever, kwargs=payload)
+        self.websocket_thread.daemon = True
+        self.websocket_thread.start()
+
+        try:
+            idx = await wait_for_first_event(
+                self.state.ws_connected_event,
+                self.state.auth_rejected_event,
+                self.state.ws_error_event,
+                self.state.ws_closed_event,
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            return False, "Timeout waiting for websocket open"
+
+        if idx == 0:
+            return True, "Websocket connected successfully!!!"
+        elif idx == 1:
+            self.state.SSID = None
+            return False, "Websocket Token Rejected."
+        elif idx == 2:
+            return False, self.state.websocket_error_reason or "Websocket error"
+        elif idx == 3:
+            return False, "Websocket connection closed."
+        return False, "Unknown websocket state"
+
+    async def send_ssid(self, timeout=10):
+        if not self.state.SSID:
+            return False
+        if self.state.auth_accepted_event is None:
+            self.state.init_events()
+        self.state.auth_accepted_event.clear()
+        self.state.auth_rejected_event.clear()
+
+        payload = {"session": self.state.SSID, "isDemo": self.account_type, "tournamentId": 0}
+        data = f'42["authorization",{json.dumps(payload)}]'
+        self.send_websocket_request(data)
+
+        try:
+            idx = await wait_for_first_event(
+                self.state.auth_accepted_event,
+                self.state.auth_rejected_event,
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            return False
+        return idx == 0
+
+    async def connect(self, is_demo):
+        self.account_type = 1 if is_demo else 0
+        self.state.ssl_Mutual_exclusion = False
+        self.state.ssl_Mutual_exclusion_write = False
+        check_websocket, websocket_reason = await self.start_websocket()
+        if not check_websocket:
+            return check_websocket, websocket_reason
+        check_ssid = await self.send_ssid()
+        if not check_ssid:
+            await self.authenticate()
+            if self.state.SSID:
+                await self.send_ssid()
+        return check_websocket, websocket_reason
+
+    async def close(self):
+        if self.websocket_client and self.websocket_client.wss:
+            self.websocket_client.wss.close()
+            await asyncio.sleep(1)
+        if self.websocket_thread and self.websocket_thread.is_alive():
+            self.websocket_thread.join(timeout=5)
+        return True
+
+
+# ==============================================================================
+# SECTION 7: QUOTEX STABLE API + CANDLE PARSING
+# ==============================================================================
+_request_counter = itertools.count(int(time.time() * 1000))
+
+
+def _parse_raw_candles(raw_candles):
+    """يُحوّل الشموع الخام من WebSocket إلى قائمة dicts بصيغة OHLC موحّدة.
+
+    يدعم ثلاث صيغ يمكن أن يُرسلها الخادم عبر "history/load":
+      1) [time, open, close, high, low]       — صيغة Quotex الشائعة (5 عناصر)
+      2) [time, open, close, high, low, vol] — نفس الصيغة مع volume (6 عناصر)
+      3) {"time", "open", "high", "low", "close", ...} — dict
+      4) [time, price(, volume)] — tick فردي (يُحوّل إلى شمعة بسيطة)
+    """
+    if not raw_candles:
+        return []
+    parsed = []
+    for c in raw_candles:
+        try:
+            if isinstance(c, dict) and 'time' in c:
+                t = int(c.get('time', c.get('timestamp', 0)))
+                o = float(c.get('open', 0) or 0)
+                h = float(c.get('high', c.get('max', 0)) or 0)
+                l = float(c.get('low', c.get('min', 0)) or 0)
+                cl = float(c.get('close', c.get('c', 0)) or 0)
+                v = int(c.get('volume', c.get('vol', 0)) or 0)
+                if t > 0 and o > 0 and h > 0 and l > 0 and cl > 0:
+                    parsed.append({'time': t, 'open': o, 'high': h, 'low': l,
+                                   'close': cl, 'volume': v})
+            elif isinstance(c, (list, tuple)) and len(c) >= 5:
+                t = int(c[0]); o = float(c[1]); cl = float(c[2])
+                h = float(c[3]); l = float(c[4])
+                v = int(c[5]) if len(c) >= 6 else 0
+                if t > 0 and o > 0 and h > 0 and l > 0 and cl > 0:
+                    parsed.append({'time': t, 'open': o, 'high': h, 'low': l,
+                                   'close': cl, 'volume': v})
+            elif isinstance(c, (list, tuple)) and len(c) >= 2:
+                t = int(c[0]); p = float(c[1])
+                v = int(c[2]) if len(c) >= 3 else 0
+                if t > 0 and p > 0:
+                    parsed.append({'time': t, 'open': p, 'high': p, 'low': p,
+                                   'close': p, 'volume': v})
+        except (TypeError, ValueError):
+            continue
+    return parsed
+
+
+def process_candles_v2(history, asset, data):
+    if not history or not isinstance(history, dict):
+        return data if data else []
+    candles_data = history.get(asset, {})
+    candles = candles_data.get("candles", [])[1:] if candles_data else []
+    combined = candles + (data if data else [])
+    if combined:
+        candle_dict = {c.get('time'): c for c in combined if isinstance(c, dict) and 'time' in c}
+        return list(candle_dict.values()) if candle_dict else []
+    return combined
+
+
+def merge_candles(candles_data):
+    if not candles_data:
+        return []
+    candle_dict = {c['time']: c for c in candles_data if isinstance(c, dict) and 'time' in c}
+    return sorted(candle_dict.values(), key=lambda x: x['time']) if candle_dict else []
+
+
+class Quotex:
+    def __init__(self, email=None, password=None, host="quotex.com", lang="en",  # <--- تم التحديث هنا
+                 proxies=None, user_data_dir="browser",
+                 asset_default="EURUSD_otc", period_default=60):
+        self.email = email
+        self.password = password
+        self.host = host
+        self.lang = lang
+        self.proxies = proxies
+        self.user_data_dir = user_data_dir
+        self.asset_default = asset_default
+        self.period_default = period_default
+        self.account_is_demo = 1
+        self.codes_asset = {}
+        self.api = None
+        self.subscribe_candle = []
+        self.subscribe_candle_all_size = []
+        self.subscribe_mood = []
+        session = load_session(self.email, USER_AGENT)
+        self.session_data = session
+
+    async def check_connect(self):
+        if self.api is None:
+            return False
+        try:
+            await wait_until(
+                lambda: self.api.state.check_accepted_connection == 1,
+                timeout=2.0, poll_interval=0.05,
+            )
+            return True
+        except asyncio.TimeoutError:
+            return self.api.state.check_accepted_connection == 1
+
+    async def connect(self):
+        self.api = QuotexAPI(self.host, self.email, self.password, self.lang,
+                             proxies=self.proxies, user_data_dir=self.user_data_dir)
+        self.api.session_data = self.session_data
+        self.api.state.SSID = self.session_data.get("token")
+        self.api._async_loop = asyncio.get_running_loop()
+        if not self.session_data.get("token"):
+            check, reason = await self.api.authenticate()
+            if not check:
+                return check, reason
+        check, reason = await self.api.connect(self.account_is_demo == 1)
+        if not check:
+            self.session_data = {}
+            return False, "Websocket connection rejected."
+        return check, reason
+
+    async def change_account(self, balance_mode: str):
+        self.account_is_demo = 0 if balance_mode.upper() == "REAL" else 1
+        self.api.account_type = self.account_is_demo
+        payload = {"demo": self.api.account_type, "tournamentId": 0}
+        self.api.send_websocket_request(f'42["account/change",{json.dumps(payload)}]')
+
+    async def start_candles_stream(self, asset="EURUSD_otc", period=60):
+        if self.api:
+            self.api.current_asset = asset
+            self.api.current_period = period
+            self.api.subscribe_realtime_candle(asset, period)
+            self.api.chart_notification(asset)
+            self.api.follow_candle(asset)
+
+    async def _fetch_historical_batch(self, asset, fetch_time, offset, period, index, timeout):
+        if self.api is None:
+            return None
+        payload = {"asset": asset, "index": index, "time": fetch_time,
+                   "offset": offset, "period": period}
+        ws_msg = f'42["history/load",{json.dumps(payload)}]'
+        event_name = f'candles_ready_{asset}_{index}'
+        await self.api.event_registry.clear_event(event_name)
+        self.api.send_websocket_request(ws_msg)
+        try:
+            return await self.api.event_registry.wait_event(event_name, timeout=timeout)
+        except Exception:
+            return None
+
+    def _parse_historical_candles(self, raw_data):
+        if raw_data is None:
+            return []
+        raw_candles = raw_data.get("data", []) or raw_data.get("candles", [])
+        if not raw_candles:
+            return []
+        parsed = []
+        for c in raw_candles:
+            if isinstance(c, list) and len(c) >= 5:
+                parsed.append({
+                    "time": int(c[0]), "open": float(c[1]),
+                    "close": float(c[2]), "high": float(c[3]), "low": float(c[4]),
+                })
+            elif isinstance(c, dict) and "time" in c:
+                parsed.append(c)
+        return parsed
+
+    async def get_historical_candles(self, asset, amount_of_seconds, period,
+                                     timeout=30, max_workers=5, progress_callback=None):
+        """يجلب شموع تاريخية للأصل المطلوب.
+
+        المعاملات:
+          asset            : اسم الأصل بصيغة Quotex (مثلاً EURUSD_otc)
+          amount_of_seconds: عدد الثواني المطلوب جلبها للماضي
+          period           : طول الشمعة بالثواني (60 = M1, 300 = M5, 3600 = H1)
+          max_workers      : عدد العمال المتوازين (5 = السرعة الأصلية)
+        """
+        max_workers = max_workers or 1
+        chunk_seconds = period * FETCH_CHUNK_SIZE  # period * 200 = عدد الثواني لكل batch
+        all_candles = {}
+        current_time = int(time.time())
+        target_start_time = current_time - amount_of_seconds
+        block_size = amount_of_seconds // max_workers
+        semaphore = asyncio.Semaphore(max_workers)
+
+        async def worker(start_t, end_t, worker_id):
+            worker_candles = {}
+            async with semaphore:
+                oldest_t = start_t
+                consecutive_failures = 0
+                while oldest_t > end_t:
+                    # تحقق من الاتصال قبل كل batch
+                    if not self.api or not getattr(self.api.state, 'check_accepted_connection', False):
+                        break
+                    index = next(_request_counter)
+                    batch_data = await self._fetch_historical_batch(
+                        asset, oldest_t, chunk_seconds, period, index, timeout)
+                    if not batch_data:
+                        oldest_t -= chunk_seconds
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            break
+                        await asyncio.sleep(FETCH_BATCH_DELAY * 2)
+                        continue
+                    consecutive_failures = 0
+                    new_batch = self._parse_historical_candles(batch_data)
+                    if not new_batch:
+                        oldest_t -= chunk_seconds
+                        continue
+                    batch_times = []
+                    for c in new_batch:
+                        ts = c['time']
+                        if ts >= end_t and ts <= start_t:
+                            worker_candles[ts] = c
+                            batch_times.append(ts)
+                    if not batch_times:
+                        oldest_t -= chunk_seconds
+                        continue
+                    batch_times.sort()
+                    new_oldest = batch_times[0]
+                    if progress_callback:
+                        progress_callback(start_t - new_oldest, start_t - end_t,
+                                          len(worker_candles), f"Worker-{worker_id}")
+                    oldest_t = new_oldest if new_oldest < oldest_t else oldest_t - chunk_seconds
+                    await asyncio.sleep(FETCH_BATCH_DELAY)
+            return list(worker_candles.values())
+
+        await self.start_candles_stream(asset, period)
+        tasks = []
+        for i in range(max_workers):
+            s = current_time - (i * block_size)
+            e = max(target_start_time, s - block_size)
+            tasks.append(worker(s, e, i))
+        results = await asyncio.gather(*tasks)
+        for batch in results:
+            for c in batch:
+                all_candles[c['time']] = c
+        return sorted(all_candles.values(), key=lambda x: x['time'])
+
+    async def close(self):
+        if self.api:
+            return await self.api.close()
+        return True
+
+
+# ==============================================================================
+# SECTION 8: CONSTANTS & CONFIG (جديد)
+# ==============================================================================
+CREDENTIALS_FILE = Path("credentials.json")
+
+# مجلد حفظ الشموع — ملفات JSON تُحفظ مباشرة هنا بدون مجلدات فرعية.
+CANDLES_DIR = Path("candles_otc_data")
+CANDLES_DIR.mkdir(exist_ok=True)
+
+# قائمة العملات الـ13 (OTC) — تُجلب تلقائياً عند اختيار الخيار 2 بعد تسجيل الدخول.
+OTC_ASSETS = [
+    "BRLUSD_otc",   # Brazil
+    "USDARS_otc",   # Argentina
+    "USDBDT_otc",   # Bangladesh
+    "USDCOP_otc",   # Colombia
+    "USDDZD_otc",   # Algeria
+    "USDEGP_otc",   # Egypt
+    "USDIDR_otc",   # Indonesia
+    "USDINR_otc",   # India
+    "USDMXN_otc",   # Mexico
+    "USDNGN_otc",   # Nigeria
+    "USDPHP_otc",   # Philippines
+    "USDPKR_otc",   # Pakistan
+    "USDZAR_otc",   # South Africa
+]
+
+# إعدادات الجلب — متوازي 5 workers (السرعة الأصلية ~4s لكل 1000 شمعة)
+FETCH_MAX_WORKERS = 5
+FETCH_CHUNK_SIZE = 200         # 200 شمعة لكل batch
+FETCH_BATCH_DELAY = 0.1        # 0.1s بين batches
+MAX_FETCH_RETRIES = 5
+RETRY_BACKOFF_BASE = 2
+RETRY_BACKOFF_MAX = 15
+KEEPALIVE_INTERVAL = 5         # ping كل 5 ثوانٍ للحفاظ على الاتصال بين عمليات الجلب
+RECONNECT_CHECK_INTERVAL = 10  # فحص حالة الاتصال كل 10 ثوانٍ
+MAX_RECONNECT_ATTEMPTS = 5     # عدد محاولات إعادة الاتصال قبل الاستسلام
+RECONNECT_BACKOFF_BASE = 3     # ثانية بين المحاولات (يتضاعف)
+
+# أدوات التسجيل
+LOG_FILE = Path("candal.log")
+
+
+def logmsg(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"  \033[2m[{ts}]\033[0m {msg}")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+
+def log_exception(context: str, exc: BaseException):
+    ts = datetime.now().strftime("%H:%M:%S")
+    tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    print(f"  \033[91m[{ts}] FATAL in {context}: {exc}\033[0m")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] FATAL in {context}: {exc}\n{tb_text}\n")
+    except Exception:
+        pass
+
+
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    BLUE = '\033[94m'
+    YELLOW = '\033[93m'
+    CYAN = '\033[96m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    RESET = '\033[0m'
+
+
+# التقاط استثناءات الـ threads
+def _thread_excepthook(args):
+    log_exception(f"thread '{args.thread.name}'", args.exc_value)
+threading.excepthook = _thread_excepthook
+
+
+def _main_excepthook(exc_type, exc_value, exc_tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    log_exception("main thread (top level)", exc_value)
+sys.excepthook = _main_excepthook
+
+
+# ==============================================================================
+# SECTION 9: CREDENTIALS MANAGEMENT (حفظ الإيميل وكلمة المرور)
+# ==============================================================================
+SESSION_FILE = Path("session.json")
+BROWSER_DIR = Path("browser")
+
+
+def purge_old_session() -> None:
+    """Delete any saved Quotex session so we always log in fresh.
+
+    Quotex may reject connections that reuse a stale token from a previous
+    run. By deleting session.json and the browser/ cache directory on
+    startup, we force a brand-new login every time.
+    """
+    try:
+        if SESSION_FILE.exists():
+            SESSION_FILE.unlink()
+    except Exception:
+        pass
+    try:
+        if BROWSER_DIR.exists():
+            shutil.rmtree(BROWSER_DIR, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def load_credentials() -> Optional[Dict[str, str]]:
+    """يقرأ بيانات الدخول من credentials.json. يُعيد None إذا لم توجد."""
+    if not CREDENTIALS_FILE.exists():
+        return None
+    try:
+        data = json.loads(CREDENTIALS_FILE.read_text())
+        if data.get("email") and data.get("password"):
+            return data
+        return None
+    except Exception:
+        return None
+
+
+def save_credentials(email: str, password: str, proxy: str = "") -> bool:
+    """يحفظ بيانات الدخول والبروكسي في credentials.json لإعادة الاستخدام لاحقاً."""
+    try:
+        existing = {}
+        if CREDENTIALS_FILE.exists():
+            try: existing = json.loads(CREDENTIALS_FILE.read_text())
+            except Exception: pass
+        existing.update({
+            "email": email,
+            "password": password,
+            "proxy": proxy,
+            "saved_at": int(time.time())
+        })
+        CREDENTIALS_FILE.write_text(json.dumps(existing, indent=2))
+        return True
+    except Exception as e:
+        logmsg(f"Failed to save credentials: {e}")
+        return False
+
+
+# ==============================================================================
+# SECTION 10: ASSET NAME NORMALIZATION
+# ==============================================================================
+def normalize_asset(raw: str) -> str:
+    """يُنظّف اسم الأصل ولا يضيف _otc إلا إذا كتبتها أنت.
+
+    أمثلة:
+      "XAUUSD"      -> "XAUUSD"        (حقيقي، بدون otc)
+      "XAUUSD_otc"  -> "XAUUSD_otc"
+      "xauusd otc"  -> "XAUUSD_otc"
+      "EUR/USD"     -> "EURUSD"
+    """
+    s = re.sub(r'[^a-zA-Z0-9]', '', raw.strip())
+    if not s:
+        return ""
+    is_otc = s.upper().endswith("OTC")
+    if is_otc:
+        s = s[:-3]
+    s = s.upper()
+    if not s:
+        return ""
+    return f"{s}_otc" if is_otc else s
+
+
+def pretty_asset(symbol: str, timeframe_min: int) -> str:
+    """يُعيد اسم عرض جميل: EUR/USD · OTC (M5)"""
+    base = symbol
+    suffix = ""
+    if base.upper().endswith("_OTC"):
+        base = base[:-4]
+        suffix = " · OTC"
+    if len(base) == 6 and base.isalpha():
+        pretty = f"{base[:3]}/{base[3:]}{suffix}"
+    else:
+        pretty = f"{base}{suffix}"
+    return f"{pretty} (M{timeframe_min})"
+
+
+# ==============================================================================
+# SECTION 11: JSON FILE SAVING (منسّق: شمعة واحدة في كل سطر)
+# ==============================================================================
+def save_candles_to_json(candles: List[Dict], asset: str, timeframe_min: int, days: int) -> Optional[Path]:
+    """يحفظ الشموع في ملف JSON منسّق باسم: {asset}_{timeframe}m_{days}d_{random}.json
+
+    كل شمعة في سطر واحد مع تاريخ مقروء (UTC) بجانب الـ timestamp.
+    """
+    if not candles:
+        logmsg("No candles to save.")
+        return None
+
+    def fmt_dt(ts: int) -> str:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    random_suffix = ''.join(random.choices('0123456789abcdef', k=8))
+    filepath = CANDLES_DIR / f"{asset}_{timeframe_min}m_{days}d_{random_suffix}.json"
+
+    meta = {
+        "asset": asset,
+        "display_name": pretty_asset(asset, timeframe_min),
+        "is_otc": asset.lower().endswith("_otc"),
+        "timeframe_minutes": timeframe_min,
+        "days_requested": days,
+        "candle_count": len(candles),
+        "first_candle": fmt_dt(candles[0]['time']),
+        "last_candle": fmt_dt(candles[-1]['time']),
+        "first_candle_time": candles[0]['time'],
+        "last_candle_time": candles[-1]['time'],
+        "timezone": "UTC",
+        "fetch_time": datetime.now().isoformat(timespec="seconds"),
+        "fetch_timestamp": int(time.time()),
+    }
+
+    try:
+        meta_txt = json.dumps(meta, indent=2, ensure_ascii=False).replace("\n", "\n  ")
+        rows = []
+        for c in candles:
+            row = {
+                "datetime": fmt_dt(c['time']),
+                "time": c['time'],
+                "open": c['open'],
+                "high": c['high'],
+                "low": c['low'],
+                "close": c['close'],
+                "volume": c.get('volume', 0),
+            }
+            rows.append("    " + json.dumps(row, ensure_ascii=False))
+        body = ",\n".join(rows)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write('{\n')
+            f.write(f'  "metadata": {meta_txt},\n')
+            f.write('  "candles": [\n')
+            f.write(body + '\n')
+            f.write('  ]\n}\n')
+        return filepath
+    except Exception as e:
+        log_exception("save_candles_to_json", e)
+        return None
+
+
+# ==============================================================================
+# SECTION 12: FETCH LOGIC (جديد)
+# ==============================================================================
+async def keepalive_loop(client: Quotex, stop_event: asyncio.Event):
+    """حلقة keepalive بسيطة ترسل ping كل KEEPALIVE_INTERVAL ثانية.
+    تحافظ على اتصال WebSocket حياً بين عمليات الجلب، وتتوقف فوراً عند ضبط stop_event."""
+    while not stop_event.is_set():
+        try:
+            if client and client.api:
+                client.api.send_websocket_request("2", no_force_send=False)
+                client.api.send_websocket_request('42["tick"]', no_force_send=False)
+        except Exception:
+            pass
+        # انتظار قابل للإيقاف: يخرج فوراً عند ضبط stop_event
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=KEEPALIVE_INTERVAL)
+        except asyncio.TimeoutError:
+            pass  # انتهى المحدّد = أرسل ping التالي
+
+
+# ------------------------------------------------------------------------------
+# آلية "عدم النوم" (مستوحاة من الكود الضخم wedsoket_.py)
+# ------------------------------------------------------------------------------
+# مشترك بين keepalive_loop و auto_reconnect_loop لتجديد كائن Quotex عند الفقد.
+# يتم تحديثه عبر attribute set بدلاً من closure لتفادي مشاكل الـ late binding.
+class _ClientHolder:
+    """حاوية بسيطة تتيح لـ auto_reconnect استبدال كائن Quotex برمجياً."""
+    def __init__(self, client: Optional[Quotex]):
+        self.client = client
+        self.email: Optional[str] = None
+        self.password: Optional[str] = None
+        self.proxies: Optional[str] = None
+        self.lock = asyncio.Lock()
+
+
+def _is_connection_alive(client: Optional[Quotex]) -> bool:
+    """فحص سريع: هل اتصال Quotex ما زال نشطاً؟
+    يعيد False بأمان لأي كائن لا يحتوي على api أو state."""
+    if client is None:
+        return False
+    try:
+        api = getattr(client, "api", None)
+        if api is None:
+            return False
+        state = getattr(api, "state", None)
+        if state is None:
+            return False
+        return bool(getattr(state, "check_accepted_connection", False))
+    except Exception:
+        return False
+
+
+async def auto_reconnect_loop(holder: _ClientHolder, stop_event: asyncio.Event,
+                              on_reconnect=None) -> None:
+    """راقب حالة الاتصال كل RECONNECT_CHECK_INTERVAL ثانية. عند الفقد،
+    حاول إعادة الاتصال تلقائياً حتى MAX_RECONNECT_ATTEMPTS محاولة.
+
+    - لا يوقف البرنامج أبداً ما لم يُضبط stop_event.
+    - يستبدل holder.client بكائن Quotex جديد عند نجاح إعادة الاتصال.
+    - يستدعي on_reconnect(new_client) إن وُجدت (لإعلام الـ fetcher باستخدام الكائن الجديد).
+    """
+    while not stop_event.is_set():
+        try:
+            alive = _is_connection_alive(holder.client)
+            if not alive:
+                logmsg(f"{Colors.YELLOW}[reconnect] connection lost, attempting reconnect...{Colors.RESET}")
+                backoff = RECONNECT_BACKOFF_BASE
+                for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+                    if stop_event.is_set():
+                        return
+                    try:
+                        new_client = Quotex(
+                            email=holder.email,
+                            password=holder.password,
+                            host="quotex.com",
+                            lang="en",
+                            proxies=holder.proxies,
+                        )
+                        check, reason = await new_client.connect()
+                        if check:
+                            try:
+                                await new_client.change_account("PRACTICE")
+                                await asyncio.sleep(0.5)
+                            except Exception:
+                                pass
+                            async with holder.lock:
+                                # أغلق القديم بهدوء قبل الاستبدال
+                                try:
+                                    if holder.client:
+                                        await holder.client.close()
+                                except Exception:
+                                    pass
+                                holder.client = new_client
+                            logmsg(f"{Colors.GREEN}[reconnect] reconnect successful on attempt {attempt}{Colors.RESET}")
+                            if on_reconnect:
+                                try:
+                                    on_reconnect(new_client)
+                                except Exception as cb_err:
+                                    logmsg(f"[reconnect] on_reconnect callback raised: {cb_err}")
+                            break
+                        else:
+                            err = str(reason) if reason else "Unknown"
+                            logmsg(f"[reconnect] attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} failed: {err}")
+                    except Exception as e:
+                        logmsg(f"[reconnect] attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} raised: {e}")
+                    if attempt < MAX_RECONNECT_ATTEMPTS:
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 30)
+                else:
+                    logmsg(f"{Colors.RED}[reconnect] all {MAX_RECONNECT_ATTEMPTS} attempts failed; "
+                           f"will retry in {RECONNECT_CHECK_INTERVAL}s.{Colors.RESET}")
+        except Exception as e:
+            log_exception("auto_reconnect_loop", e)
+        # انتظار قابل للإيقاف
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=RECONNECT_CHECK_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def connect_quotex(email: str, password: str, max_attempts: int = 3,
+                         proxies: Optional[str] = None) -> Optional[Quotex]:
+    """يتصل بـ Quotex ويعيد كائن Quotex. يُعيد None عند الفشل.
+
+    المعاملات:
+      email      : بريد Quotex
+      password   : كلمة المرور
+      max_attempts: عدد محاولات الاتصال
+      proxies    : URL البروكسي (مثل "http://1.2.3.4:8080" أو "socks5://1.2.3.4:1080")
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            client = Quotex(email=email, password=password,
+                            host="quotex.com", lang="en",  # <--- تم التحديث هنا
+                            proxies=proxies)
+            check, reason = await client.connect()
+            if check:
+                try:
+                    await client.change_account("PRACTICE")
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+                logmsg(f"Connected to Quotex as {email}")
+                return client
+            else:
+                err = str(reason) if reason else "Unknown error"
+                logmsg(f"Login attempt {attempt}/{max_attempts} failed: {err}")
+        except Exception as e:
+            logmsg(f"Login attempt {attempt}/{max_attempts} raised: {e}")
+        if attempt < max_attempts:
+            await asyncio.sleep(3 * attempt)
+    return None
+
 # ============================================================================
+# SECTION 2: EXTENDED COLOR SYSTEM + FORMATTING HELPERS
+# ============================================================================
+
 # SECTION 2: COLOR SYSTEM + FORMATTING HELPERS
 # ============================================================================
 class C2:
