@@ -1882,12 +1882,14 @@ class MessageInterceptor:
     def __init__(self, client: Quotex):
         self.client = client
         self.instruments: List[Dict] = []
-        # profit_by_asset = LAST value seen (for reference)
-        # max_profit_by_asset = HIGHEST value seen (the real payout %)
-        # profit_history = list of all values seen (for debugging)
+        # profit_by_asset = LAST value from depth/change (for reference)
+        # max_profit_by_asset = HIGHEST value from any source
+        # profit_history = list of all values from depth/change (for MODE)
+        # instruments_profit_by_asset = payout from instruments/list (AUTHORITATIVE)
         self.profit_by_asset: Dict[str, int] = {}
         self.max_profit_by_asset: Dict[str, int] = {}
         self.profit_history: Dict[str, List[int]] = defaultdict(list)
+        self.instruments_profit_by_asset: Dict[str, int] = {}
         self.enabled_by_asset: Dict[str, bool] = {}
         self.live_prices: Dict[str, float] = {}
         self.live_ticks_seen: Dict[str, int] = defaultdict(int)
@@ -2398,7 +2400,7 @@ class MessageInterceptor:
                     if enabled is not None:
                         self.enabled_by_asset[asset] = enabled
 
-            # === Array form: [id, symbol, name, type, ..., payout(5), ..., open(14)] ===
+            # === Array form: [id, symbol, name, type, ?, payout(5), ..., open(14)] ===
             elif isinstance(item, list) and len(item) >= 6:
                 array_count += 1
                 asset = item[1] if isinstance(item[1], str) else None
@@ -2413,9 +2415,10 @@ class MessageInterceptor:
                                 p_int = int(float(profit))
                             except Exception:
                                 p_int = 0
-                        # FILTER: only accept payout in valid range [70, 94]
-                        if p_int and 70 <= p_int <= 94:
-                            self.profit_by_asset[asset] = p_int
+                        # Store in instruments_profit_by_asset (AUTHORITATIVE)
+                        if p_int:
+                            self.instruments_profit_by_asset[asset] = p_int
+                            # Also update max
                             if p_int > self.max_profit_by_asset.get(asset, 0):
                                 self.max_profit_by_asset[asset] = p_int
                     if enabled is not None:
@@ -2423,7 +2426,7 @@ class MessageInterceptor:
 
         elog.success(f"[instruments] captured via {strategy}: {len(data)} entries "
                      f"({dict_count} dict, {array_count} array), "
-                     f"{len(self.profit_by_asset)} profit %, {size:,} bytes")
+                     f"{len(self.instruments_profit_by_asset)} payout %, {size:,} bytes")
         if not self.instruments_ready.is_set():
             self.instruments_ready.set()
 
@@ -2559,24 +2562,25 @@ class MessageInterceptor:
         """Return the payout % for this asset.
 
         Priority:
-          1. MODE of profit_history (most common value across all sources:
-             depth/change + orders/closed + instruments/list)
-          2. MAX as fallback (highest value seen)
-
-        The MODE is the most stable because:
-          - orders/closed always sends the REAL payout (e.g. 92%)
-          - depth/change alternates between CALL and PUT values
-          - The real payout appears most frequently
+          1. instruments_profit_by_asset — from instruments/list binary frame
+             (AUTHORITATIVE — the REAL payout, item[5] in the array)
+          2. MODE of profit_history (from depth/change + orders/closed)
+          3. MAX as last fallback
         """
-        history = self.profit_history.get(asset, [])
-        if not history:
-            return self.max_profit_by_asset.get(asset)
+        # Priority 1: instruments/list (most reliable)
+        if asset in self.instruments_profit_by_asset:
+            return self.instruments_profit_by_asset[asset]
 
-        # Calculate mode
-        from collections import Counter
-        counter = Counter(history)
-        mode_value, mode_count = counter.most_common(1)[0]
-        return mode_value
+        # Priority 2: MODE of history
+        history = self.profit_history.get(asset, [])
+        if history:
+            from collections import Counter
+            counter = Counter(history)
+            mode_value, _ = counter.most_common(1)[0]
+            return mode_value
+
+        # Priority 3: MAX
+        return self.max_profit_by_asset.get(asset)
 
     def get_last_profit(self, asset: str) -> Optional[int]:
         """Return the LAST payout % seen (for debugging)."""
