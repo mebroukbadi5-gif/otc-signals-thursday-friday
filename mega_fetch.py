@@ -1903,6 +1903,7 @@ class MessageInterceptor:
         self._expecting_instruments_binary = False
         self._expecting_depth_change_binary = False
         self._expecting_quotes_stream_binary = False
+        self._expecting_orders_binary = False
         self._temp_status_instruments = ""
         self._temp_status_history = ""  # tracks which asset we're awaiting
 
@@ -2062,6 +2063,8 @@ class MessageInterceptor:
                     self._expecting_depth_change_binary = True
                 elif "quotes/stream" in text:
                     self._expecting_quotes_stream_binary = True
+                elif "orders/closed" in text or "orders/opened" in text:
+                    self._expecting_orders_binary = True
                 elif "history/list" in text or "history/load" in text:
                     self._temp_status_history = text
             # Try to extract live ticks from EVERY text frame (not just '42'-prefixed)
@@ -2145,36 +2148,85 @@ class MessageInterceptor:
             return
 
         # Route the decoded payload based on what we're expecting.
-        # The Quotex server sends binary frames in response to text
-        # announcements — we track the announcement type in the text handler.
 
-        # Case A: depth/change → payout % per asset
-        # Format: [["EURUSD_otc",95], ["USDARS_otc",92], ...]
+        # Case A: orders/closed or orders/opened → REAL payout % from trades
+        # Format: [{"id":"...","asset":"USDMXN_otc","percentProfit":92,...}, ...]
+        if self._expecting_orders_binary:
+            self._expecting_orders_binary = False
+            self._handle_orders(decoded)
+            return
+
+        # Case B: depth/change → payout % per asset (fluctuating CALL/PUT)
         if self._expecting_depth_change_binary:
             self._expecting_depth_change_binary = False
             self._handle_depth_change(decoded)
             return
 
-        # Case B: quotes/stream → live price ticks
-        # Format: [["USDARS_otc",1792778133.816,1621.74,1], ...]
+        # Case C: quotes/stream → live price ticks
         if self._expecting_quotes_stream_binary:
             self._expecting_quotes_stream_binary = False
             self._handle_quotes_stream(decoded)
             return
 
-        # Case C: instruments/list → profit % + enabled status (full list)
+        # Case D: instruments/list → full instruments list
         if self._expecting_instruments_binary or self._looks_like_instruments(decoded):
             self._handle_instruments(decoded, decode_strategy, len(data))
             self._expecting_instruments_binary = False
             self._temp_status_instruments = ""
             return
 
-        # Case D: historical candles (history/list/v2 response)
-        # Format: {"asset":"BRLUSD_otc","period":60,"history":[[ts,price,type],...]}
+        # Case E: historical candles (history/list/v2 response)
         if self._temp_status_history or self._looks_like_history(decoded):
             self._handle_history(decoded)
             self._temp_status_history = ""
             return
+
+    def _handle_orders(self, data: Any) -> None:
+        """Handle orders/closed/list binary frame — the REAL payout source.
+
+        Each order contains:
+          - asset: the OTC pair name
+          - percentProfit: the REAL payout % (e.g. 92)
+          - profit: actual profit amount
+          - amount: investment amount
+
+        This is the most reliable source of payout % because it reflects
+        actual executed trades, not the fluctuating CALL/PUT values
+        from depth/change.
+
+        Strategy: extract percentProfit for each asset and store as
+        the AUTHORITATIVE payout (overwrites any value from depth/change).
+        """
+        if not isinstance(data, list):
+            return
+
+        new_count = 0
+        for order in data:
+            if not isinstance(order, dict):
+                continue
+            asset = order.get("asset")
+            percent_profit = order.get("percentProfit")
+            if asset and percent_profit is not None:
+                try:
+                    p_int = int(percent_profit)
+                    # Store as the authoritative payout
+                    self.profit_by_asset[asset] = p_int
+                    # Also update max
+                    if p_int > self.max_profit_by_asset.get(asset, 0):
+                        self.max_profit_by_asset[asset] = p_int
+                    # Track history (orders are the MOST reliable source)
+                    self.profit_history[asset].append(p_int)
+                    if len(self.profit_history[asset]) > 30:
+                        self.profit_history[asset] = self.profit_history[asset][-30:]
+                    if asset not in self.enabled_by_asset:
+                        self.enabled_by_asset[asset] = True
+                    new_count += 1
+                except (ValueError, TypeError):
+                    pass
+
+        if new_count > 0 and DEBUG_WS_TRAFFIC:
+            elog.info(f"[orders/closed] REAL payout captured for {new_count} trades | "
+                      f"assets: {len(self.max_profit_by_asset)}")
 
     def _handle_depth_change(self, data: Any) -> None:
         """Handle depth/change binary frame: payout % per asset.
@@ -2504,13 +2556,17 @@ class MessageInterceptor:
 
     # === Public API ===
     def get_profit(self, asset: str) -> Optional[int]:
-        """Return the MODE (most common value) of payout % for this asset.
+        """Return the payout % for this asset.
 
-        The Quotex server sends fluctuating payout values — some are CALL
-        payouts (high), some are PUT payouts (low). The MODE is the value
-        that appears most frequently, which is typically the real payout.
+        Priority:
+          1. MODE of profit_history (most common value across all sources:
+             depth/change + orders/closed + instruments/list)
+          2. MAX as fallback (highest value seen)
 
-        If no history, fall back to MAX.
+        The MODE is the most stable because:
+          - orders/closed always sends the REAL payout (e.g. 92%)
+          - depth/change alternates between CALL and PUT values
+          - The real payout appears most frequently
         """
         history = self.profit_history.get(asset, [])
         if not history:
@@ -2819,36 +2875,40 @@ class LivePriceSubscriber:
             self.subscribe(asset, period)
 
     def refresh_payouts(self, assets: List[str]) -> None:
-        """Force-refresh payout % for each asset by sending chart_notification/get
-        with the asset name explicitly.
+        """Force-refresh payout % for each asset by sending multiple requests.
 
-        The Quotex server responds to this by sending a fresh depth/change
-        frame with the CURRENT payout for that asset (both CALL and PUT
-        directions, alternating).
+        Sends:
+          1. chart_notification/get for each asset (forces depth/change push)
+          2. orders/closed (forces server to push closed orders with REAL payout)
+          3. instruments/get (forces full instruments list push)
 
-        This is the key trick: by sending the request FOR EACH ASSET
-        individually, we force the server to send us the latest payout
-        for each one, instead of waiting for the periodic broadcast.
+        The orders/closed response is the MOST reliable source because it
+        contains percentProfit from actual executed trades.
         """
         api = self.interceptor.client.api
         for asset in assets:
             try:
-                # 1) Update the asset (sets it as the active chart)
                 api.send_websocket_request(
                     f'42["instruments/update",{{"asset":"{asset}","period":60}}]',
                     no_force_send=False,
                 )
-                # 2) Request chart notification — server responds with payout
                 api.send_websocket_request(
                     f'42["chart_notification/get",{{"asset":"{asset}","version":"1.0.0"}}]',
                     no_force_send=False,
                 )
-                # 3) Follow depth for this asset — forces payout push
                 api.send_websocket_request(f'42["depth/follow","{asset}"]', no_force_send=False)
-                # 4) Also request instruments/get — server may push full list
-                api.send_websocket_request('42["instruments/get"]', no_force_send=False)
             except Exception as e:
                 elog.debug(f"[refresh] failed for {asset}: {e}")
+        # Request closed orders (contains REAL percentProfit)
+        try:
+            api.send_websocket_request('42["orders/closed"]', no_force_send=False)
+        except Exception:
+            pass
+        # Request instruments list (full payout data)
+        try:
+            api.send_websocket_request('42["instruments/get"]', no_force_send=False)
+        except Exception:
+            pass
 
     def unsubscribe(self, asset: str) -> None:
         api = self.interceptor.client.api
