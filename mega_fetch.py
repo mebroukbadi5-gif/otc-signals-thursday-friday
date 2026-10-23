@@ -3550,7 +3550,15 @@ async def main_async():
         # ============================================================
         # LIVE PRICE MONITOR — in-place updates (no scrolling)
         # ============================================================
-        NUM_ROWS = len(OTC_ASSETS) + 4  # header (4) + assets
+        # Table layout:
+        #   Row 1: 📊 LIVE PRICES — HH:MM:SS
+        #   Row 2: ───
+        #   Row 3: Asset | Profit | Live Price | Δ | Ticks
+        #   Row 4: ───
+        #   Rows 5..17: 13 asset rows
+        #   Row 18: ───
+        # Total = 4 (header) + 13 (assets) + 1 (footer) = 18 rows
+        NUM_ROWS = len(OTC_ASSETS) + 5  # 4 header + 13 assets + 1 footer = 18
         CURSOR_UP = f"\033[{NUM_ROWS}A"
         CLEAR_LINE = "\033[2K"
 
