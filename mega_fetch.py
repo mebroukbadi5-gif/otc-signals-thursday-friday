@@ -1917,15 +1917,26 @@ class MessageInterceptor:
                 pass
 
     def _try_capture_binary(self, data: bytes) -> None:
-        """Try to decode a binary frame as JSON (with 0x04 strip) or msgpack."""
-        if len(data) < 128:
-            return  # too small
+        """Try to decode a binary frame as JSON (with 0x04 strip) or msgpack.
+
+        Ported and enhanced from wedsoket_.py's _onMessage pattern:
+          1. Strip leading 0x04 byte (Engine.IO binary marker)
+          2. Find first '[' or '{' and JSON-parse the rest
+          3. Fallback to msgpack if JSON fails
+
+        Handles BOTH instrument formats Quotex may send:
+          - Dict form:  [{"asset":"USDARS_otc","profit":92,"enabled":true}, ...]
+          - Array form: [[1,"USDARS_otc","USD/ARS",...,92,...,true], ...]
+        """
+        # Lower threshold (was 128) — some binary frames are smaller
+        if len(data) < 32:
+            return
 
         decoded = None
         decode_strategy = "none"
 
-        # Strategy 1: strip 0x04, JSON
-        candidate = data[1:] if len(data) > 0 and data[0] == 0x04 else data
+        # Strategy 1: strip 0x04, then JSON (the working Node.js pattern)
+        candidate = data[1:] if data[0] == 0x04 else data
         try:
             text = candidate.decode("utf-8", errors="ignore")
             start_idx = -1
@@ -1941,7 +1952,7 @@ class MessageInterceptor:
         except Exception:
             pass
 
-        # Strategy 2: raw JSON
+        # Strategy 2: raw JSON (no byte strip)
         if decoded is None:
             try:
                 text = data.decode("utf-8", errors="ignore")
@@ -1958,7 +1969,7 @@ class MessageInterceptor:
             except Exception:
                 pass
 
-        # Strategy 3: msgpack fallback
+        # Strategy 3: msgpack fallback (rare, but possible)
         if decoded is None:
             try:
                 import msgpack
@@ -1968,10 +1979,15 @@ class MessageInterceptor:
                 pass
 
         if decoded is None:
+            # Debug: log unrecognized binary frames
+            if len(data) >= 100:
+                preview_hex = data[:32].hex(' ')
+                elog.debug(f"[binary] unrecognized frame: {len(data)} bytes, "
+                           f"hex: {preview_hex}")
             return
 
         # Route the decoded payload
-        # Case A: instruments/list (expected)
+        # Case A: instruments/list (expected or auto-detected)
         if self._expecting_instruments_binary or self._looks_like_instruments(decoded):
             self._handle_instruments(decoded, decode_strategy, len(data))
             self._expecting_instruments_binary = False
@@ -1986,22 +2002,36 @@ class MessageInterceptor:
 
     @staticmethod
     def _looks_like_instruments(data: Any) -> bool:
+        """Heuristic: is this a list of instrument dicts OR arrays?
+
+        Supports both formats Quotex may send:
+          - Dict form:  [{"asset":"USDARS_otc","profit":92,...}, ...]
+          - Array form: [[1,"USDARS_otc","USD/ARS",...,92,...,true], ...]
+        """
         if not isinstance(data, list) or len(data) < 5:
             return False
         sample = data[:5]
-        for item in sample:
-            if not isinstance(item, dict):
-                return False
-            if not any(k in item for k in ("asset", "id", "symbol", "name")):
-                return False
-        return True
+
+        # Dict form: each item must be a dict with asset/id/symbol/name
+        if all(isinstance(item, dict) for item in sample):
+            for item in sample:
+                if not any(k in item for k in ("asset", "id", "symbol", "name")):
+                    return False
+            return True
+
+        # Array form: each item must be a list with >= 6 elements
+        # (id, symbol, name, type, ..., payout, ..., open)
+        if all(isinstance(item, list) and len(item) >= 6 for item in sample):
+            # Second element should be a string (asset name)
+            if all(isinstance(item[1], str) for item in sample):
+                return True
+
+        return False
 
     @staticmethod
     def _looks_like_history(data: Any) -> bool:
         if not isinstance(data, list) or len(data) < 1:
             return False
-        # Each candle is either a dict {time, open, high, low, close}
-        # or an array [time, open, close, high, low]
         first = data[0]
         if isinstance(first, dict) and 'time' in first:
             return True
@@ -2010,7 +2040,15 @@ class MessageInterceptor:
         return False
 
     def _handle_instruments(self, data: Any, strategy: str, size: int) -> None:
-        """Process the instruments list and extract profit % per asset."""
+        """Process the instruments list and extract profit % per asset.
+
+        Handles BOTH formats (mirrors wedsoket_.py's printAssetsTable logic):
+          - Dict form:  item.get("profit") or item.get("payout")
+          - Array form:  item[5] (payout at index 5)
+        And enabled status:
+          - Dict form:  item.get("enabled") or item.get("open") or item.get("isOpen")
+          - Array form: item[14] (open flag at index 14)
+        """
         # Unwrap Socket.IO envelope if present
         if isinstance(data, list) and len(data) == 2 and isinstance(data[0], str):
             data = data[1]
@@ -2024,20 +2062,61 @@ class MessageInterceptor:
             return
 
         self.instruments = data
+        dict_count = 0
+        array_count = 0
         for item in data:
-            if not isinstance(item, dict):
-                continue
-            asset = item.get("asset") or item.get("id") or item.get("symbol")
-            profit = item.get("profit") or item.get("payout")
-            enabled = item.get("enabled") if "enabled" in item else item.get("open")
-            if asset:
-                if profit is not None:
-                    self.profit_by_asset[asset] = int(profit)
-                if enabled is not None:
-                    self.enabled_by_asset[asset] = bool(enabled)
+            # === Dict form ===
+            if isinstance(item, dict):
+                dict_count += 1
+                # Asset name: try multiple field names
+                asset = (item.get("asset") or item.get("name") or
+                         item.get("symbol") or item.get("id"))
+                # Profit %: try "profit" then "payout"
+                profit = item.get("profit")
+                if profit is None:
+                    profit = item.get("payout")
+                # Enabled: try "enabled", "open", "isOpen"
+                enabled = None
+                for k in ("enabled", "open", "isOpen"):
+                    if k in item:
+                        enabled = bool(item[k])
+                        break
+                if asset:
+                    if profit is not None:
+                        try:
+                            self.profit_by_asset[asset] = int(profit)
+                        except (ValueError, TypeError):
+                            try:
+                                self.profit_by_asset[asset] = int(float(profit))
+                            except Exception:
+                                pass
+                    if enabled is not None:
+                        self.enabled_by_asset[asset] = enabled
 
-        elog.success(f"[instruments] captured via {strategy}: {len(data)} entries, "
-                     f"{size:,} bytes, {len(self.profit_by_asset)} profit %")
+            # === Array form: [id, symbol, name, type, ..., payout(5), ..., open(14)] ===
+            elif isinstance(item, list) and len(item) >= 6:
+                array_count += 1
+                # item[1] = symbol/asset name
+                asset = item[1] if isinstance(item[1], str) else None
+                # item[5] = payout percentage
+                profit = item[5] if len(item) > 5 else None
+                # item[14] = open flag
+                enabled = bool(item[14]) if len(item) > 14 else None
+                if asset:
+                    if profit is not None:
+                        try:
+                            self.profit_by_asset[asset] = int(profit)
+                        except (ValueError, TypeError):
+                            try:
+                                self.profit_by_asset[asset] = int(float(profit))
+                            except Exception:
+                                pass
+                    if enabled is not None:
+                        self.enabled_by_asset[asset] = enabled
+
+        elog.success(f"[instruments] captured via {strategy}: {len(data)} entries "
+                     f"({dict_count} dict, {array_count} array), "
+                     f"{len(self.profit_by_asset)} profit %, {size:,} bytes")
         if not self.instruments_ready.is_set():
             self.instruments_ready.set()
 
