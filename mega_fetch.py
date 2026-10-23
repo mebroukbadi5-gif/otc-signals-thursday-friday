@@ -3547,122 +3547,94 @@ async def main_async():
         # The interceptor's _fill_missing_slots (ported from wedsoket_.py)
         # is applied to the LIVE prices: if a price for an asset is missing
         # (no tick received), the previous price is carried forward.
-        # This is the same gap-filling logic used for candles.
-        print(f"\n{hr(70, '═', C2.BRIGHT_GREEN)}")
-        print(f"  {paint_bold('LIVE PRICE MONITOR', C2.BRIGHT_GREEN)} — "
-              f"press Ctrl+C to stop")
-        print(hr(70, '═', C2.BRIGHT_GREEN))
-        print(f"  {paint_dim('Displaying live prices for 13 OTC pairs.')}")
-        print(f"  {paint_dim('Payouts refreshed every 5s. Prices update in real-time.')}")
+        # ============================================================
+        # LIVE PRICE MONITOR — in-place updates (no scrolling)
+        # ============================================================
+        NUM_ROWS = len(OTC_ASSETS) + 4  # header (4) + assets
+        CURSOR_UP = f"\033[{NUM_ROWS}A"
+        CLEAR_LINE = "\033[2K"
+
+        print(f"\n{hr(70, '=', C2.BRIGHT_GREEN)}")
+        print(f"  {paint_bold('LIVE PRICE MONITOR', C2.BRIGHT_GREEN)} — press Ctrl+C to stop")
+        print(hr(70, '=', C2.BRIGHT_GREEN))
+        print(f"  {paint_dim('Updating prices in-place. Payouts refreshed every 10s.')}")
         print()
 
-        # Track previous prices for gap-filling (carry forward)
-        prev_prices: Dict[str, float] = {}
+        prev_prices = {}
         last_refresh_time = 0.0
         last_resubscribe_time = 0.0
-        last_display_time = 0.0
-        display_interval = 2.0       # show table every 2 seconds
-        refresh_interval = 5.0       # refresh payouts every 5 seconds
-        resubscribe_interval = 10.0  # re-subscribe every 10 seconds
+        last_instruments_time = 0.0
+        refresh_interval = 10.0
+        resubscribe_interval = 30.0
+        instruments_interval = 15.0
+
+        def render_table():
+            now_str = datetime.now().strftime("%H:%M:%S")
+            sys.stdout.write(CURSOR_UP)
+            sys.stdout.write(f"\r{CLEAR_LINE}  {paint_bold('LIVE PRICES', C2.BRIGHT_CYAN)}  {paint_dim('— ' + now_str)}\n")
+            sys.stdout.write(f"{CLEAR_LINE}{'─' * 95}\n")
+            sys.stdout.write(f"{CLEAR_LINE}  {'Asset':<16} {'Profit':<10} {'Live Price':<16} {'Δ':<16} {'Ticks':<8}\n")
+            sys.stdout.write(f"{CLEAR_LINE}{'─' * 95}\n")
+            for asset in OTC_ASSETS:
+                profit = interceptor.get_profit(asset)
+                live = interceptor.get_live_price(asset)
+                ticks = interceptor.live_ticks_seen.get(asset, 0)
+                if live is None and asset in prev_prices:
+                    live = prev_prices[asset]
+                if profit is not None:
+                    if profit >= 80: profit_color = C2.BRIGHT_GREEN
+                    elif profit >= 70: profit_color = C2.BRIGHT_YELLOW
+                    elif profit >= 50: profit_color = C2.BRIGHT_RED
+                    else: profit_color = C2.DIM
+                    profit_str = paint_bold(f"{profit}%", profit_color)
+                else:
+                    profit_str = paint_dim("N/A")
+                if live is not None:
+                    live_str = paint_bold(f"{live:.5f}", C2.BRIGHT_CYAN)
+                    prev = prev_prices.get(asset)
+                    if prev is not None:
+                        delta = live - prev
+                        if delta > 0: delta_str = paint(C2.BRIGHT_GREEN, f"▲ {delta:+.5f}")
+                        elif delta < 0: delta_str = paint(C2.BRIGHT_RED, f"▼ {delta:+.5f}")
+                        else: delta_str = paint_dim("= 0.00000")
+                    else:
+                        delta_str = paint_dim("—")
+                    prev_prices[asset] = live
+                else:
+                    live_str = paint_dim("—")
+                    delta_str = paint_dim("—")
+                ticks_str = paint_dim(f"{ticks}")
+                sys.stdout.write(f"{CLEAR_LINE}  {paint_bold(asset, C2.BRIGHT_YELLOW):<16} {profit_str:<10} {live_str:<16} {delta_str:<16} {ticks_str:<8}\n")
+            sys.stdout.write(f"{CLEAR_LINE}{'─' * 95}\n")
+            sys.stdout.flush()
+
+        render_table()
 
         try:
             while True:
                 now = time.time()
-
-                # Refresh payouts every 5 seconds
                 if now - last_refresh_time >= refresh_interval:
-                    try:
-                        live_sub.refresh_payouts(OTC_ASSETS)
-                    except Exception:
-                        pass
+                    try: live_sub.refresh_payouts(OTC_ASSETS)
+                    except: pass
                     last_refresh_time = now
-
-                # Re-subscribe to live prices every 10 seconds (keep alive)
+                if now - last_instruments_time >= instruments_interval:
+                    try:
+                        api = client.api
+                        api.send_websocket_request('42["instruments/get"]', no_force_send=False)
+                    except: pass
+                    last_instruments_time = now
                 if now - last_resubscribe_time >= resubscribe_interval:
                     try:
                         for asset in OTC_ASSETS:
                             live_sub.subscribe(asset, period=60)
-                    except Exception:
-                        pass
+                    except: pass
                     last_resubscribe_time = now
-
-                # Display the live price table every 2 seconds
-                if now - last_display_time >= display_interval:
-                    # Build table
-                    now_str = datetime.now().strftime("%H:%M:%S")
-                    print(f"\r{'─' * 95}", end='')
-                    print(f"\n  {paint_bold('📊 LIVE PRICES', C2.BRIGHT_CYAN)}  "
-                          f"{paint_dim('— ' + now_str)}")
-                    print(f"{'─' * 95}")
-                    print(f"  {'Asset':<16} {'Max Profit':<14} {'Last':<6} "
-                          f"{'Live Price':<14} {'Δ':<14} {'Ticks':<8}")
-                    print(f"{'─' * 95}")
-
-                    for asset in OTC_ASSETS:
-                        max_profit = interceptor.get_profit(asset)
-                        last_profit = interceptor.get_last_profit(asset)
-                        live = interceptor.get_live_price(asset)
-                        ticks = interceptor.live_ticks_seen.get(asset, 0)
-
-                        # GAP-FILLING for live prices (ported from wedsoket_.py):
-                        # If no live price received yet, carry forward the
-                        # previous price (same logic as _fill_missing_slots
-                        # for candles — use previous close as flat price).
-                        if live is None and asset in prev_prices:
-                            live = prev_prices[asset]
-
-                        # Profit display with color
-                        if max_profit is not None:
-                            if max_profit >= 80:
-                                profit_color = C2.BRIGHT_GREEN
-                            elif max_profit >= 60:
-                                profit_color = C2.BRIGHT_YELLOW
-                            elif max_profit >= 30:
-                                profit_color = C2.BRIGHT_RED
-                            else:
-                                profit_color = C2.DIM
-                            profit_str = paint_bold(f"{max_profit}%", profit_color)
-                        else:
-                            profit_str = paint_dim("N/A")
-
-                        last_str = f"{last_profit}" if last_profit is not None else "—"
-
-                        if live is not None:
-                            live_str = paint_bold(f"{live:.5f}", C2.BRIGHT_CYAN)
-                            # Calculate delta from previous
-                            prev = prev_prices.get(asset)
-                            if prev is not None:
-                                delta = live - prev
-                                if delta > 0:
-                                    delta_str = paint(C2.BRIGHT_GREEN, f"▲ {delta:+.5f}")
-                                elif delta < 0:
-                                    delta_str = paint(C2.BRIGHT_RED, f"▼ {delta:+.5f}")
-                                else:
-                                    delta_str = paint_dim("= 0.00000")
-                            else:
-                                delta_str = paint_dim("—")
-                            # Update prev_prices
-                            prev_prices[asset] = live
-                        else:
-                            live_str = paint_dim("—")
-                            delta_str = paint_dim("—")
-
-                        ticks_str = paint_dim(f"{ticks}")
-                        print(f"  {paint_bold(asset, C2.BRIGHT_YELLOW):<16} "
-                              f"{profit_str:<14} "
-                              f"{paint_dim(last_str):<6} "
-                              f"{live_str:<14} "
-                              f"{delta_str:<14} "
-                              f"{ticks_str:<8}")
-
-                    print(f"{'─' * 95}")
-                    last_display_time = now
-
-                # Sleep briefly to avoid high CPU usage
+                render_table()
                 await asyncio.sleep(0.5)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             print(f"\n{paint(C2.BRIGHT_YELLOW, 'Stopping live monitor...')}")
+
 
     finally:
         # Cleanup
