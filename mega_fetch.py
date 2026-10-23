@@ -1994,7 +1994,48 @@ class MessageInterceptor:
 
         # === CAPTURE ===
         if isinstance(msg, (bytes, bytearray)):
+            # Binary frame: try to capture (instruments/ticks/payout)
             self._try_capture_binary(bytes(msg))
+
+            # CRITICAL: also pass decoded history/list/v2 frames to the
+            # original handler so that candles_ready events fire.
+            # The original on_message in OTC_canda_.py only parses text
+            # frames where msg_str[1] in ('[', '{'), so binary history
+            # frames are NEVER processed by it — which means
+            # get_historical_candles() returns 0 candles!
+            #
+            # We decode the binary frame, check if it looks like a history
+            # response, and if so, wrap it as a fake text message that
+            # the original handler can parse.
+            try:
+                raw = bytes(msg)
+                if len(raw) > 0 and raw[0] == 0x04:
+                    text_candidate = raw[1:].decode('utf-8', errors='ignore')
+                    # Find first '[' or '{'
+                    start_idx = -1
+                    for i, ch in enumerate(text_candidate):
+                        if ch in ('[', '{'):
+                            start_idx = i
+                            break
+                    if start_idx >= 0:
+                        # Try to parse as JSON to verify it's a real payload
+                        try:
+                            parsed = json.loads(text_candidate[start_idx:])
+                            # Check if it's a history response (has 'asset' and 'history')
+                            if isinstance(parsed, dict) and "asset" in parsed and "history" in parsed:
+                                # Wrap as a fake text message that the original handler can parse
+                                # The original handler expects msg_str[1] in ('[', '{')
+                                # so we add a '4' prefix (Engine.IO MESSAGE marker)
+                                fake_msg = f"4{json.dumps(parsed)}"
+                                if self._original_on_message is not None:
+                                    try:
+                                        self._original_on_message(wss, fake_msg)
+                                    except Exception as e:
+                                        elog.debug(f"[interceptor] history forward raised: {e}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         else:
             text = msg if isinstance(msg, str) else msg.decode("utf-8", errors="ignore")
             # Detect ANY _placeholder announcement — track which type of
