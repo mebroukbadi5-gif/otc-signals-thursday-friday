@@ -1861,7 +1861,12 @@ class MessageInterceptor:
     def __init__(self, client: Quotex):
         self.client = client
         self.instruments: List[Dict] = []
-        self.profit_by_asset: Dict[str, int] = {}  # asset → profit %
+        # profit_by_asset = LAST value seen (for reference)
+        # max_profit_by_asset = HIGHEST value seen (the real payout %)
+        # profit_history = list of all values seen (for debugging)
+        self.profit_by_asset: Dict[str, int] = {}
+        self.max_profit_by_asset: Dict[str, int] = {}
+        self.profit_history: Dict[str, List[int]] = defaultdict(list)
         self.enabled_by_asset: Dict[str, bool] = {}
         self.live_prices: Dict[str, float] = {}
         self.live_ticks_seen: Dict[str, int] = defaultdict(int)
@@ -2104,6 +2109,18 @@ class MessageInterceptor:
 
         Format: [["EURUSD_otc",95], ["USDARS_otc",92], ...]
         Each entry: [asset_name, payout_percent]
+
+        IMPORTANT: The Quotex server sends DIFFERENT payout values over time
+        for the SAME asset (e.g. USDZAR_otc might appear as 96%, then later
+        as 5%, then later as 96% again). This happens because the server
+        sometimes sends the payout for the OPPOSITE direction (PUT vs CALL),
+        or sends 0 during the brief moment when a payout is being recalculated.
+
+        To handle this, we keep BOTH:
+          - max profit (the highest payout % seen — this is the real one)
+          - last profit (the most recent value)
+          - history (all values seen, for debugging)
+        The summary table uses MAX profit, which is always the real payout.
         """
         if not isinstance(data, list):
             return
@@ -2113,13 +2130,23 @@ class MessageInterceptor:
                 asset = item[0]
                 payout = item[1]
                 if isinstance(asset, str) and isinstance(payout, (int, float)):
-                    self.profit_by_asset[asset] = int(payout)
+                    payout_int = int(payout)
+                    # Track history for debugging
+                    self.profit_history[asset].append(payout_int)
+                    # Keep only last 20 values to avoid memory bloat
+                    if len(self.profit_history[asset]) > 20:
+                        self.profit_history[asset] = self.profit_history[asset][-20:]
+                    # Save last value (for reference)
+                    self.profit_by_asset[asset] = payout_int
+                    # Keep the MAX profit (real payout is always the highest)
+                    if payout_int > self.max_profit_by_asset.get(asset, 0):
+                        self.max_profit_by_asset[asset] = payout_int
                     if asset not in self.enabled_by_asset:
                         self.enabled_by_asset[asset] = True
                     new_count += 1
         if new_count > 0 and DEBUG_WS_TRAFFIC:
             elog.info(f"[depth/change] payout captured for {new_count} assets "
-                      f"(total known: {len(self.profit_by_asset)})")
+                      f"(total known: {len(self.max_profit_by_asset)})")
 
     def _handle_quotes_stream(self, data: Any) -> None:
         """Handle quotes/stream binary frame: live price ticks.
@@ -2394,7 +2421,21 @@ class MessageInterceptor:
 
     # === Public API ===
     def get_profit(self, asset: str) -> Optional[int]:
+        """Return the HIGHEST payout % seen for this asset (the real payout).
+
+        The Quotex server sends fluctuating payout values over time —
+        sometimes 0% or very low values during recalculation. The REAL
+        payout is always the maximum we've ever seen.
+        """
+        return self.max_profit_by_asset.get(asset)
+
+    def get_last_profit(self, asset: str) -> Optional[int]:
+        """Return the LAST payout % seen (for debugging)."""
         return self.profit_by_asset.get(asset)
+
+    def get_profit_history(self, asset: str) -> List[int]:
+        """Return all payout values seen for this asset (for debugging)."""
+        return list(self.profit_history.get(asset, []))
 
     def get_enabled(self, asset: str) -> Optional[bool]:
         return self.enabled_by_asset.get(asset)
@@ -2408,7 +2449,9 @@ class MessageInterceptor:
             'ticks_seen': self.live_ticks_seen.get(asset, 0),
             'last_tick_ago': time.time() - self.last_tick_at[asset]
                              if asset in self.last_tick_at else None,
-            'profit': self.profit_by_asset.get(asset),
+            'profit': self.get_profit(asset),  # max profit (real payout)
+            'last_profit': self.profit_by_asset.get(asset),
+            'profit_history': self.get_profit_history(asset),
             'enabled': self.enabled_by_asset.get(asset),
         }
 
@@ -2881,24 +2924,55 @@ class InstrumentsFetcher:
         return self.interceptor.get_enabled(asset)
 
     def print_summary(self, assets: List[str]):
-        """Print a summary table of profit % and enabled status for the given assets."""
+        """Print a summary table of profit % and enabled status for the given assets.
+
+        Shows MAX payout % (the real one) + history of recent values for debugging.
+        """
         print()
-        print(hr(70, '─', C2.DIM))
+        print(hr(95, '─', C2.DIM))
         print(f"  {paint_bold('📊 INSTRUMENTS SUMMARY', C2.BRIGHT_CYAN)}")
-        print(hr(70, '─', C2.DIM))
-        print(f"  {'Asset':<18} {'Profit %':<12} {'Status':<10} {'Live Price':<15}")
-        print(hr(70, '─', C2.DIM))
+        print(hr(95, '─', C2.DIM))
+        print(f"  {'Asset':<16} {'Max Profit':<14} {'Last':<6} {'History (recent)':<35} {'Status':<8} {'Live Price':<12}")
+        print(hr(95, '─', C2.DIM))
         for asset in assets:
-            profit = self.get_profit(asset)
+            max_profit = self.interceptor.get_profit(asset)
+            last_profit = self.interceptor.get_last_profit(asset)
+            history = self.interceptor.get_profit_history(asset)
             enabled = self.get_enabled(asset)
             live = self.interceptor.get_live_price(asset)
-            profit_str = paint_bold(f"{profit}%", C2.BRIGHT_GREEN) if profit is not None else paint_dim("N/A")
+
+            # Color the profit based on value (high = green, low = red)
+            if max_profit is not None:
+                if max_profit >= 80:
+                    profit_color = C2.BRIGHT_GREEN
+                elif max_profit >= 60:
+                    profit_color = C2.BRIGHT_YELLOW
+                elif max_profit >= 30:
+                    profit_color = C2.BRIGHT_RED
+                else:
+                    profit_color = C2.DIM
+                profit_str = paint_bold(f"{max_profit}%", profit_color)
+            else:
+                profit_str = paint_dim("N/A")
+
+            last_str = f"{last_profit}" if last_profit is not None else "—"
+            # Show last 5 history values
+            if history:
+                history_str = ",".join(str(h) for h in history[-5:])
+            else:
+                history_str = "—"
+
             enabled_str = (paint_bold("OPEN", C2.BRIGHT_GREEN) if enabled
                            else paint_bold("CLOSED", C2.BRIGHT_RED) if enabled is False
                            else paint_dim("?"))
             live_str = paint_bold(f"{live:.5f}", C2.BRIGHT_CYAN) if live is not None else paint_dim("—")
-            print(f"  {paint_bold(asset, C2.BRIGHT_YELLOW):<18} {profit_str:<12} {enabled_str:<10} {live_str:<15}")
-        print(hr(70, '─', C2.DIM))
+            print(f"  {paint_bold(asset, C2.BRIGHT_YELLOW):<16} "
+                  f"{profit_str:<14} "
+                  f"{paint_dim(last_str):<6} "
+                  f"{paint_dim(history_str):<35} "
+                  f"{enabled_str:<8} "
+                  f"{live_str:<12}")
+        print(hr(95, '─', C2.DIM))
         print()
 
 
