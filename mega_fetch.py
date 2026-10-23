@@ -1764,6 +1764,14 @@ TARGET_CANDLE_COUNT = 500
 TIMEFRAME_DEFAULT = 1
 GAP_FILL_MAX_SLOTS = 1440
 
+# Fetch strategy (ported from OTC_canda_.py)
+FETCH_MAX_WORKERS = 5
+FETCH_CHUNK_SIZE = 200         # 200 candles per batch (server paging)
+FETCH_BATCH_DELAY = 0.1        # 0.1s between batches
+MAX_FETCH_RETRIES = 5          # retry failed fetches 5 times
+RETRY_BACKOFF_BASE = 2         # initial backoff (2s)
+RETRY_BACKOFF_MAX = 15         # max backoff (15s)
+
 # Never-sleep engine timings (ported from wedsoket_.py)
 KEEPALIVE_PING_INTERVAL = 5         # seconds between pings
 STALE_MESSAGE_TIMEOUT = 45         # if no message for 45s, recycle connection
@@ -2865,12 +2873,13 @@ class CandleFetcher:
     async def fetch_exactly_n(self, asset: str, timeframe_min: int,
                               target_count: int = TARGET_CANDLE_COUNT,
                               progress: bool = True) -> List[Dict]:
-        """Fetch exactly target_count candles for asset — OTC_canda_ method.
+        """Fetch exactly target_count candles for asset — same method as OTC_canda_.py.
 
-        Calculates the MINIMUM seconds needed to get target_count candles
-        (uses SECONDS for precision, not days — no rounding up to full days).
-        For M1 + 500 candles: only 30,000 seconds (~8.3 hours) needed.
-        For M5 + 500 candles: 150,000 seconds (~1.74 days) needed.
+        Uses the EXACT same approach as fetch_candles_for_asset in OTC_canda_.py:
+          1. Calculate amount_of_seconds from target_count + buffer
+          2. Call client.get_historical_candles with max_workers=5 and progress_callback
+          3. On failure, RETRY up to MAX_FETCH_RETRIES times with exponential backoff
+          4. Dedup by timestamp + sort + gap-fill + truncate to target_count
         """
         period_seconds = int(timeframe_min * 60)
         display_name = f"{asset} (M{timeframe_min})"
@@ -2879,135 +2888,144 @@ class CandleFetcher:
             elog.error(f"No client for {asset}")
             return []
 
-        print(f"\n  {paint_bold('Fetching ', C2.BRIGHT_CYAN)}"
-              f"{paint_bold(f'{target_count} candles', C2.BRIGHT_GREEN)} — {display_name}")
-
         # === Calculate MINIMUM seconds needed for target_count candles ===
-        # We use SECONDS for precision, BUT enforce a MINIMUM of 1 day
-        # (86,400 seconds) because Quotex may not serve history shorter
-        # than that — server returned 0 candles when we asked for 10 hours.
-        #
-        # Buffer = +20% to ensure enough after dedup.
+        # +20% buffer to ensure enough after dedup
+        # MINIMUM 1 day (86400s) — Quotex may not serve shorter history
         total_seconds_needed = target_count * period_seconds
         amount_of_seconds = int(total_seconds_needed * 1.2)
-        # Enforce minimum 1 day (Quotex requires it)
-        MIN_HISTORY_SECONDS = 86400  # 1 day
+        MIN_HISTORY_SECONDS = 86400  # 1 day minimum
         if amount_of_seconds < MIN_HISTORY_SECONDS:
             amount_of_seconds = MIN_HISTORY_SECONDS
 
-        # For display: convert to days/hours
+        # Timeout: 60s minimum, +60s per day
         days_float = amount_of_seconds / 86400
+        timeout = max(60, int(days_float * 60))
+
+        print(f"\n  {paint_bold('Fetching ', C2.BRIGHT_CYAN)}"
+              f"{paint_bold(f'{target_count} candles', C2.BRIGHT_GREEN)} — {display_name}")
         if days_float >= 1:
             duration_str = f"{days_float:.2f} day(s)"
         else:
             hours_float = amount_of_seconds / 3600
             duration_str = f"{hours_float:.1f} hour(s)"
-
-        # Timeout: 60s minimum, +1s per 1000 seconds of history
-        timeout = max(60, amount_of_seconds // 1000)
-        fetch_start = time.time()
-
         expected_candles = amount_of_seconds // period_seconds
         elog.info(f"Requesting {duration_str} of {asset} history "
                   f"({amount_of_seconds:,}s = ~{expected_candles:,} candles, need {target_count})")
 
-        # === Progress callback (same as OTC_canda_.py) ===
-        # Shared progress tracker for all 5 workers
-        progress_state = {
-            'candles': 0,
-            'oldest_ts': int(time.time()),
-            'start_ts': int(time.time()),
-            'target_ts': int(time.time()) - amount_of_seconds,
-            'lock': threading.Lock(),
-            'last_print': 0.0,
-            'fetch_start': fetch_start,
-            'worker_candles': [0] * 5,
-        }
+        # === RETRY LOOP — same as OTC_canda_.py ===
+        candles = []
+        for attempt in range(1, MAX_FETCH_RETRIES + 1):
+            # Check connection before each attempt
+            if (client is None or client.api is None
+                    or not getattr(client.api.state, 'check_accepted_connection', False)):
+                elog.error(f"Connection dead before attempt {attempt}; aborting.")
+                return []
 
-        def progress_callback(seconds_done, total_seconds, candles_count, worker_label):
-            now = time.time()
-            with progress_state['lock']:
-                try:
-                    wid = int(worker_label.split('-')[1]) if '-' in worker_label else 0
-                    if 0 <= wid < 5:
-                        progress_state['worker_candles'][wid] = candles_count
-                except Exception:
-                    pass
-                progress_state['candles'] = sum(progress_state['worker_candles'])
-                current_oldest = progress_state['start_ts'] - seconds_done
-                if current_oldest < progress_state['oldest_ts']:
-                    progress_state['oldest_ts'] = current_oldest
-                # Throttle prints to 0.3s
-                if now - progress_state['last_print'] < 0.3:
-                    return
-                progress_state['last_print'] = now
+            # Progress tracker (thread-safe) — shared by all 5 workers
+            progress_state = {
+                'candles': 0,
+                'oldest_ts': int(time.time()),
+                'start_ts': int(time.time()),
+                'target_ts': int(time.time()) - amount_of_seconds,
+                'lock': threading.Lock(),
+                'last_print': 0.0,
+                'fetch_start': time.time(),
+                'worker_candles': [0] * FETCH_MAX_WORKERS,
+            }
 
-                elapsed = now - progress_state['fetch_start']
-                total_span = progress_state['start_ts'] - progress_state['target_ts']
-                done_span = progress_state['start_ts'] - progress_state['oldest_ts']
-                pct = min(done_span / total_span, 1.0) if total_span > 0 else 0
-                bar_len = 30
-                filled = int(bar_len * pct)
-                bar = paint(C2.BRIGHT_GREEN, '█' * filled) + paint(C2.DIM, '░' * (bar_len - filled))
-                speed = progress_state['candles'] / elapsed if elapsed > 0 else 0
-                if pct > 0.01:
-                    eta = elapsed * (1.0 - pct) / pct
-                    eta_str = f"{int(eta//60):02d}:{int(eta%60):02d}"
-                else:
-                    eta_str = "  ?  "
-                elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
-                candle_count = progress_state['candles']
-                sys.stdout.write(
-                    f"\r  {paint('[', C2.DIM)}{bar}{paint(']', C2.DIM)} "
-                    f"{pct*100:5.1f}% | "
-                    f"{paint_bold(str(candle_count), C2.BRIGHT_GREEN)}"
-                    f"/{target_count} | "
-                    f"{elapsed_str} | "
-                    f"{speed:>5.0f} c/s | "
-                    f"ETA {eta_str}   "
+            def progress_callback(seconds_done, total_seconds, candles_count, worker_label):
+                now = time.time()
+                with progress_state['lock']:
+                    try:
+                        wid = int(worker_label.split('-')[1]) if '-' in worker_label else 0
+                        if 0 <= wid < FETCH_MAX_WORKERS:
+                            progress_state['worker_candles'][wid] = candles_count
+                    except Exception:
+                        pass
+                    progress_state['candles'] = sum(progress_state['worker_candles'])
+                    current_oldest = progress_state['start_ts'] - seconds_done
+                    if current_oldest < progress_state['oldest_ts']:
+                        progress_state['oldest_ts'] = current_oldest
+                    if now - progress_state['last_print'] < 0.3:
+                        return
+                    progress_state['last_print'] = now
+
+                    elapsed = now - progress_state['fetch_start']
+                    total_span = progress_state['start_ts'] - progress_state['target_ts']
+                    done_span = progress_state['start_ts'] - progress_state['oldest_ts']
+                    pct = min(done_span / total_span, 1.0) if total_span > 0 else 0
+                    bar_len = 30
+                    filled = int(bar_len * pct)
+                    bar = paint(C2.BRIGHT_GREEN, '█' * filled) + paint(C2.DIM, '░' * (bar_len - filled))
+                    speed = progress_state['candles'] / elapsed if elapsed > 0 else 0
+                    if pct > 0.01:
+                        eta = elapsed * (1.0 - pct) / pct
+                        eta_str = f"{int(eta//60):02d}:{int(eta%60):02d}"
+                    else:
+                        eta_str = "  ?  "
+                    elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
+                    candle_count = progress_state['candles']
+                    sys.stdout.write(
+                        f"\r  {paint('[', C2.DIM)}{bar}{paint(']', C2.DIM)} "
+                        f"{pct*100:5.1f}% | "
+                        f"{paint_bold(str(candle_count), C2.BRIGHT_GREEN)}"
+                        f"/{target_count} | "
+                        f"{elapsed_str} | "
+                        f"{speed:>5.0f} c/s | "
+                        f"ETA {eta_str}   "
+                    )
+                    sys.stdout.flush()
+
+            elog.info(f"Attempt {attempt}/{MAX_FETCH_RETRIES} ...")
+            fetch_start = time.time()
+            try:
+                candles_raw = await asyncio.wait_for(
+                    client.get_historical_candles(
+                        asset,
+                        amount_of_seconds=amount_of_seconds,
+                        period=period_seconds,
+                        max_workers=FETCH_MAX_WORKERS,
+                        progress_callback=progress_callback,
+                    ),
+                    timeout=timeout,
                 )
-                sys.stdout.flush()
+                # Force a 100% progress print
+                with progress_state['lock']:
+                    progress_state['candles'] = len(candles_raw) if candles_raw else 0
+                    progress_state['oldest_ts'] = progress_state['target_ts']
+                    progress_state['last_print'] = 0
+                if progress:
+                    progress_callback(amount_of_seconds, amount_of_seconds,
+                                      len(candles_raw) if candles_raw else 0, "Worker-0")
+                    print()
+            except asyncio.TimeoutError:
+                if progress: print()
+                elog.warn(f"Attempt {attempt}/{MAX_FETCH_RETRIES}: fetch timed out.")
+                candles_raw = []
+            except Exception as e:
+                if progress: print()
+                elog.warn(f"Attempt {attempt}/{MAX_FETCH_RETRIES} raised: {e}")
+                candles_raw = []
 
-        # === SINGLE CALL — same as OTC_canda_.py:fetch_candles_for_asset ===
-        try:
-            candles_raw = await asyncio.wait_for(
-                client.get_historical_candles(
-                    asset,
-                    amount_of_seconds=amount_of_seconds,
-                    period=period_seconds,
-                    max_workers=5,
-                    progress_callback=progress_callback,
-                ),
-                timeout=timeout,
-            )
-            # Force a 100% progress print
-            with progress_state['lock']:
-                progress_state['candles'] = len(candles_raw) if candles_raw else 0
-                progress_state['oldest_ts'] = progress_state['target_ts']
-                progress_state['last_print'] = 0
-            if progress:
-                progress_callback(amount_of_seconds, amount_of_seconds,
-                                  len(candles_raw) if candles_raw else 0, "Worker-0")
-                print()  # newline after progress bar
-        except asyncio.TimeoutError:
-            if progress: print()
-            elog.error(f"Fetch timed out after {timeout}s for {asset}.")
-            return []
-        except Exception as e:
-            if progress: print()
-            elog.error(f"Fetch raised for {asset}: {e}")
-            return []
+            if candles_raw:
+                elapsed = time.time() - fetch_start
+                elog.info(f"Received {len(candles_raw):,} raw candles in {int(elapsed)}s")
+                candles = candles_raw
+                break  # success, exit retry loop
 
-        if not candles_raw:
-            elog.error(f"No candles returned for {asset}.")
-            return []
+            # Exponential backoff between retries (same as OTC_canda_.py)
+            if attempt < MAX_FETCH_RETRIES:
+                delay = min(RETRY_BACKOFF_BASE * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX)
+                elog.info(f"Retry in {delay:.1f}s...")
+                await asyncio.sleep(delay)
 
-        elapsed = time.time() - fetch_start
-        elog.info(f"Received {len(candles_raw):,} raw candles in {int(elapsed)}s")
+        if not candles:
+            elog.error(f"All {MAX_FETCH_RETRIES} attempts failed for {display_name}")
+            return []
 
         # === DEDUP + FORMAT (same as OTC_canda_.py) ===
         candles_map: Dict[int, Dict] = {}
-        for c in candles_raw:
+        for c in candles:
             if not isinstance(c, dict):
                 continue
             try:
@@ -3060,9 +3078,9 @@ class CandleFetcher:
             elog.warn(f"Padded {deficit} candles at the start for {asset} "
                       f"(insufficient history).")
 
-        elapsed = time.time() - fetch_start
+        elapsed_total = time.time() - fetch_start
         elog.success(f"Fetched {len(candles)} candles in "
-                     f"{int(elapsed//60):02d}:{int(elapsed%60):02d} — {display_name}")
+                     f"{int(elapsed_total//60):02d}:{int(elapsed_total%60):02d} — {display_name}")
         return candles
 
 
@@ -3328,79 +3346,26 @@ async def main_async():
     live_sub.subscribe_all(OTC_ASSETS, period=60)
     elog.success(f"Subscribed to live prices for {len(OTC_ASSETS)} OTC pairs")
 
-    # Wait for live prices AND payout data to arrive.
-    # Quotex sends FLUCTUATING payout values (alternates between CALL and PUT
-    # payouts), so we need to wait until we've seen the HIGH value for each asset.
-    # Strategy:
-    #   1. Send refresh_payouts() every 3 seconds to force the server to push
-    #      fresh payout values for each asset individually.
-    #   2. Wait until we have MAX profit >= 70% for at least 10 of the 13 OTC
-    #      assets, OR until LIVE_PRICE_LISTEN_SECONDS elapses.
-    elog.info(f"Listening for live prices + payout data (up to {LIVE_PRICE_LISTEN_SECONDS}s)...")
-    elog.info(f"Quotex sends fluctuating payouts (CALL/PUT alternating) — "
-              f"forcing refresh every 3s...")
-    deadline = time.time() + LIVE_PRICE_LISTEN_SECONDS
-    last_status_time = 0
-    last_refresh_time = 0
-    refresh_count = 0
+    # Wait briefly for live prices to arrive (no payout data needed before fetching)
+    elog.info(f"Listening for live prices (5s)...")
+    deadline = time.time() + 5.0
     while time.time() < deadline:
-        # Force-refresh payouts every 3 seconds
-        now = time.time()
-        if now - last_refresh_time >= 3:
-            live_sub.refresh_payouts(OTC_ASSETS)
-            refresh_count += 1
-            last_refresh_time = now
-
-        # Count assets with high payout (>=70%) — these are confirmed real
-        high_payout_assets = sum(
-            1 for p in interceptor.max_profit_by_asset.values() if p >= 70
-        )
-        n_profit = len(interceptor.max_profit_by_asset)
         n_live = len(interceptor.live_prices)
-
-        # Print status every 5 seconds
-        if now - last_status_time >= 5:
-            elog.info(f"Status: {n_profit} payout% entries ({high_payout_assets} >=70%), "
-                      f"{n_live} live prices, refresh #{refresh_count}, "
-                      f"{int(deadline - now)}s remaining")
-            last_status_time = now
-
-        # Early exit if we have high payouts for at least 10 of 13 OTC pairs
-        if high_payout_assets >= 10 and n_live >= 10:
-            elog.success(f"Got high payouts for {high_payout_assets} assets "
-                         f"and {n_live} live prices (after {refresh_count} refreshes) — "
-                         f"stopping early.")
+        if n_live >= 10:
+            elog.success(f"Got {n_live} live prices — starting fetch.")
             break
         await asyncio.sleep(0.5)
 
-    # If still not all assets have high payouts, do ONE more refresh + wait 5s
-    high_payout_assets = sum(1 for p in interceptor.max_profit_by_asset.values() if p >= 70)
-    if high_payout_assets < len(OTC_ASSETS):
-        elog.warn(f"Only {high_payout_assets}/{len(OTC_ASSETS)} assets have "
-                  f"payout >= 70%. Doing final refresh + 5s wait...")
-        live_sub.refresh_payouts(OTC_ASSETS)
-        await asyncio.sleep(5.0)
-
-    n_profit = len(interceptor.max_profit_by_asset)
-    high_payout_assets = sum(1 for p in interceptor.max_profit_by_asset.values() if p >= 70)
     n_live = len(interceptor.live_prices)
-    elog.info(f"Final: {n_profit} payout% entries ({high_payout_assets} with >=70%), "
-              f"{n_live} live prices, {refresh_count} refreshes sent")
-
-    # List assets that still have low payout (for debugging)
-    low_payout = [(a, p) for a, p in interceptor.max_profit_by_asset.items() if p < 70]
-    if low_payout:
-        elog.warn(f"Assets with payout < 70% (may need more time):")
-        for a, p in low_payout:
-            elog.warn(f"  {a}: max={p}%  history={interceptor.profit_history[a][-5:]}")
-
-    if n_profit == 0:
-        elog.warn("No payout data received. Server may not have pushed depth/change yet.")
+    elog.info(f"Collected: {n_live} live prices")
     if n_live == 0:
         elog.warn("No live prices received. Market may be closed or subscription failed.")
 
-    # Print summary table (now with real MAX payouts)
-    InstrumentsFetcher(holder, interceptor).print_summary(OTC_ASSETS)
+    # NOTE: We do NOT print the instruments summary here anymore.
+    # The user requested that payout % fetching be removed from the candle
+    # fetch phase to speed it up. Payout data is still being collected in
+    # the background (interceptor captures depth/change frames automatically)
+    # and can be queried later if needed.
 
     # Ask for timeframe
     timeframe = await prompt_timeframe()
@@ -3427,21 +3392,15 @@ async def main_async():
             print(f"\n{paint_bold(f'  [{idx}/{len(OTC_ASSETS)}] {asset}', C2.BRIGHT_CYAN)}")
             print(hr(70, '─', C2.DIM))
 
-            # Show live price + profit before fetch
-            stats = interceptor.get_stats(asset)
-            if stats['price'] is not None:
-                price_str = paint_bold(f"{stats['price']}", C2.BRIGHT_GREEN)
-                ticks_str = paint_dim(f"({stats['ticks_seen']} ticks)")
+            # Show only live price before fetch (no payout — user requested removing it)
+            live_price = interceptor.get_live_price(asset)
+            ticks_seen = interceptor.live_ticks_seen.get(asset, 0)
+            if live_price is not None:
+                price_str = paint_bold(f"{live_price}", C2.BRIGHT_GREEN)
+                ticks_str = paint_dim(f"({ticks_seen} ticks)")
                 print(f"  {paint('●', C2.BRIGHT_GREEN)} Live price: {price_str} {ticks_str}")
             else:
-                print(f"  {paint('○', C2.BRIGHT_YELLOW)} No live ticks received — market may be closed")
-            if stats['profit'] is not None:
-                profit_str = paint_bold(f"{stats['profit']}%", C2.BRIGHT_GREEN)
-                if stats['enabled']:
-                    status_str = paint_bold('OPEN', C2.BRIGHT_GREEN)
-                else:
-                    status_str = paint_bold('CLOSED', C2.BRIGHT_RED)
-                print(f"  {paint('💰', C2.DIM)} Profit: {profit_str}  Status: {status_str}")
+                print(f"  {paint('○', C2.BRIGHT_YELLOW)} No live ticks — market may be closed")
 
             try:
                 candles = await fetcher.fetch_exactly_n(asset, timeframe, TARGET_CANDLE_COUNT)
