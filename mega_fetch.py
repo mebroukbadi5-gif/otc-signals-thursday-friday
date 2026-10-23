@@ -1872,12 +1872,26 @@ class MessageInterceptor:
         self.candles_data: Dict[str, List[Dict]] = {}
 
         self._original_on_message = None
+        self._original_wss_on_message = None  # WebSocketApp callback
         self._ws_client = None
         self._expecting_instruments_binary = False
         self._temp_status_instruments = ""
         self._temp_status_history = ""  # tracks which asset we're awaiting
 
     def install(self) -> bool:
+        """Install the interceptor on the WebSocket connection.
+
+        IMPORTANT: The Quotex library's WebsocketClient creates a
+        `websocket.WebSocketApp` in __init__ and passes `on_message=self.on_message`
+        to it. This means WebSocketApp captures a BOUND METHOD reference at
+        construction time. If we later patch `ws_client.on_message = ...`, the
+        WebSocketApp still holds the OLD reference and will NEVER call our
+        interceptor.
+
+        To fix this, we must patch `ws_client.wss.on_message` directly — that's
+        the attribute WebSocketApp actually calls. We also patch the WebsocketClient
+        method itself, for safety (in case it's called directly).
+        """
         api = self.client.api
         if api is None:
             return False
@@ -1885,16 +1899,39 @@ class MessageInterceptor:
         if ws_client is None:
             return False
         self._ws_client = ws_client
+
+        # Save originals
         self._original_on_message = ws_client.on_message
+
+        # 1) Patch the WebsocketClient method (in case anyone calls it directly)
         ws_client.on_message = self._on_message
-        elog.info("[interceptor] installed on WebsocketClient.on_message")
+
+        # 2) Patch the WebSocketApp callback (this is the one actually invoked
+        #    by the websocket-client library when frames arrive).
+        ws_app = getattr(ws_client, "wss", None)
+        if ws_app is not None:
+            self._original_wss_on_message = ws_app.on_message
+            ws_app.on_message = self._on_message
+            elog.info("[interceptor] installed on WebsocketClient.on_message "
+                      "AND WebSocketApp.on_message")
+        else:
+            elog.warn("[interceptor] WebSocketApp (wss) not yet available — "
+                      "only patched WebsocketClient.on_message. "
+                      "Live frames may NOT be captured.")
         return True
 
     def restore(self) -> None:
+        """Restore the original on_message handlers."""
         try:
-            if self._ws_client is not None and self._original_on_message is not None:
-                self._ws_client.on_message = self._original_on_message
-                elog.info("[interceptor] original handler restored")
+            # Restore WebSocketApp callback first
+            if self._ws_client is not None:
+                ws_app = getattr(self._ws_client, "wss", None)
+                if ws_app is not None and self._original_wss_on_message is not None:
+                    ws_app.on_message = self._original_wss_on_message
+                # Restore WebsocketClient method
+                if self._original_on_message is not None:
+                    self._ws_client.on_message = self._original_on_message
+                elog.info("[interceptor] original handlers restored")
         except Exception:
             pass
 
