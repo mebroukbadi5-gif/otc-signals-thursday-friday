@@ -1776,8 +1776,14 @@ RECONNECT_BACKOFF_MAX = 60         # maximum backoff
 LONG_DISCONNECT_THRESHOLD = 3600   # 1 hour — triggers full re-fetch
 
 # Live price settings
-LIVE_PRICE_LISTEN_SECONDS = 2.0    # how long to listen for ticks per asset
+LIVE_PRICE_LISTEN_SECONDS = 5.0    # how long to listen for ticks per asset (was 2)
 LIVE_PRICE_BROADCAST_INTERVAL = 0.5  # render interval for live price table
+
+# DEBUG: when True, every WS message is logged for diagnosis.
+# Disable by setting this to False in production.
+DEBUG_WS_TRAFFIC = True
+DEBUG_BINARY_PREVIEW_BYTES = 32
+DEBUG_TEXT_PREVIEW_CHARS = 200
 
 # Fetch strategy
 CHUNK_CANDLES = 60
@@ -1893,28 +1899,56 @@ class MessageInterceptor:
             pass
 
     def _on_message(self, wss, msg) -> None:
-        """Capture binary frames + tick arrays; chain text to original."""
-        # Binary frames: instruments/list or historical candles
+        """Capture binary frames + tick arrays; chain text to original.
+
+        With DEBUG_WS_TRAFFIC enabled, every frame is logged for diagnosis:
+          - text frames: size + first DEBUG_TEXT_PREVIEW_CHARS chars
+          - binary frames: size + first DEBUG_BINARY_PREVIEW_BYTES hex bytes
+                            + UTF-8 preview (after 0x04 strip)
+        """
+        # === DEBUG LOGGING ===
+        if DEBUG_WS_TRAFFIC:
+            try:
+                if isinstance(msg, (bytes, bytearray)):
+                    raw = bytes(msg)
+                    preview_hex = raw[:DEBUG_BINARY_PREVIEW_BYTES].hex(' ')
+                    utf8_preview = ""
+                    if len(raw) > 0:
+                        offset = 1 if raw[0] == 0x04 else 0
+                        utf8_preview = raw[offset:offset + 100].decode('utf-8', errors='replace')
+                    elog.debug(f"[ws-debug] BINARY {len(raw):,}B | hex: {preview_hex} | utf8: {utf8_preview!r}")
+                else:
+                    text = msg if isinstance(msg, str) else msg.decode("utf-8", errors="ignore")
+                    preview = text[:DEBUG_TEXT_PREVIEW_CHARS]
+                    trunc = "…" if len(text) > DEBUG_TEXT_PREVIEW_CHARS else ""
+                    elog.debug(f"[ws-debug] TEXT {len(text):,}c | {preview!r}{trunc}")
+            except Exception as e:
+                elog.debug(f"[ws-debug] preview error: {e}")
+
+        # === CAPTURE ===
         if isinstance(msg, (bytes, bytearray)):
             self._try_capture_binary(bytes(msg))
         else:
             text = msg if isinstance(msg, str) else msg.decode("utf-8", errors="ignore")
             # Detect instruments/list announcement
             if "_placeholder" in text and "instruments/list" in text:
-                self._expecting_instruments_binary = True
+                if not self._expecting_instruments_binary:
+                    self._expecting_instruments_binary = True
+                    elog.info("[interceptor] received 451-['instruments/list',{...}] announcement; "
+                              "expecting binary frame next")
                 self._temp_status_instruments = text
             # Detect history/load announcement (response with binary attachment)
             elif "_placeholder" in text and ("history/list" in text or "history/load" in text):
                 self._temp_status_history = text
-            # Try to extract live ticks from text frames
+            # Try to extract live ticks from EVERY text frame (not just '42'-prefixed)
             self._try_extract_ticks_from_text(text)
 
-        # Chain to original handler
+        # === CHAIN TO ORIGINAL ===
         if self._original_on_message is not None:
             try:
                 self._original_on_message(wss, msg)
-            except Exception:
-                pass
+            except Exception as e:
+                elog.debug(f"[interceptor] original on_message raised: {e}")
 
     def _try_capture_binary(self, data: bytes) -> None:
         """Try to decode a binary frame as JSON (with 0x04 strip) or msgpack.
@@ -2151,35 +2185,80 @@ class MessageInterceptor:
             return
 
     def _try_extract_ticks_from_text(self, text: str) -> None:
-        """Extract live price ticks from text frames like:
-           42["quotes/stream",[[asset, time, price], ...]]
-           42[<event>,[[asset, time, price], ...]]
+        """Extract live price ticks from any text frame.
+
+        Tries multiple Quotex message formats:
+          42["quotes/stream",[[asset, time, price], ...]]
+          42["depth/change",[[asset, time, price], ...]]
+          42[<event>,[[asset, time, price], ...]]
+          42[<event>,{"data":[[asset, time, price], ...]}]
+
+        Also handles raw JSON arrays (no Socket.IO prefix):
+          [[asset, time, price], ...]
         """
-        if not text.startswith("42") or "[" not in text:
+        # Try to find ANY JSON array/object in the text and parse it.
+        # The Socket.IO prefix (42, 451-, etc.) may or may not be present.
+        # We search for the first '[' or '{' character.
+        start_idx = -1
+        for i, ch in enumerate(text):
+            if ch in ('[', '{'):
+                start_idx = i
+                break
+        if start_idx < 0:
             return
+
         try:
-            json_str = text[text.index("["):]
+            json_str = text[start_idx:]
             parsed = json.loads(json_str)
-            if not isinstance(parsed, list) or len(parsed) < 2:
-                return
-            payload = parsed[1] if len(parsed) == 2 else parsed
-            self._extract_ticks(payload)
         except Exception:
-            pass
+            return
+
+        if parsed is None:
+            return
+
+        # Route to _extract_ticks which handles all payload shapes.
+        # _extract_ticks handles both bare lists and Socket.IO envelopes.
+        self._extract_ticks(parsed)
 
     def _extract_ticks(self, payload: Any) -> None:
-        """Look for tick arrays in the payload and record prices."""
+        """Look for tick arrays in the payload and record prices.
+
+        Handles ALL of these shapes (mirrors wedsoket_.py's tick handling):
+          1. [[asset, time, price], ...]                    (bare list of ticks)
+          2. ["quotes/stream", [[asset, time, price], ...]]  (Socket.IO envelope)
+          3. {"asset": asset, "price": price, ...}           (single tick dict)
+          4. {"data": [[asset, time, price], ...]}           (wrapped in 'data')
+          5. [event_name, {"data": [...]}]                   (envelope + wrapper)
+        """
         candidates = []
+
+        # Shape 1: bare list of ticks
         if isinstance(payload, list):
             if payload and isinstance(payload[0], list):
                 candidates = payload
+            # Shape 2: Socket.IO envelope [event_name, payload]
             elif payload and isinstance(payload[0], str) and len(payload) >= 2:
                 inner = payload[1]
+                # Inner could be a list of ticks
                 if isinstance(inner, list) and inner and isinstance(inner[0], list):
                     candidates = inner
-        elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
-            candidates = payload["data"]
+                # Inner could be a dict with 'data' key (Shape 5)
+                elif isinstance(inner, dict) and isinstance(inner.get("data"), list):
+                    candidates = inner["data"]
+                # Inner could be a single tick dict (Shape 3)
+                elif isinstance(inner, dict) and "asset" in inner and "price" in inner:
+                    candidates = [inner]
 
+        # Shape 3: single tick dict at top level
+        elif isinstance(payload, dict):
+            if "asset" in payload and "price" in payload:
+                candidates = [payload]
+            # Shape 4: wrapped in 'data' key
+            elif isinstance(payload.get("data"), list):
+                candidates = payload["data"]
+
+        # Extract prices from candidates
+        new_ticks = 0
         for tick in candidates:
             if isinstance(tick, list) and len(tick) >= 3:
                 asset = tick[0]
@@ -2188,6 +2267,19 @@ class MessageInterceptor:
                     self.live_prices[asset] = float(price)
                     self.live_ticks_seen[asset] += 1
                     self.last_tick_at[asset] = time.time()
+                    new_ticks += 1
+            elif isinstance(tick, dict) and "asset" in tick and "price" in tick:
+                asset = tick["asset"]
+                price = tick["price"]
+                if isinstance(asset, str) and isinstance(price, (int, float)):
+                    self.live_prices[asset] = float(price)
+                    self.live_ticks_seen[asset] += 1
+                    self.last_tick_at[asset] = time.time()
+                    new_ticks += 1
+
+        if new_ticks > 0 and DEBUG_WS_TRAFFIC:
+            elog.debug(f"[ticks] captured {new_ticks} new ticks "
+                       f"(total assets tracked: {len(self.live_prices)})")
 
     # === Public API ===
     def get_profit(self, asset: str) -> Optional[int]:
