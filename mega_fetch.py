@@ -3227,26 +3227,43 @@ class CandleFetcher:
         # and use them to REPLACE any synthetic (volume=0) candles in our data.
         # This gives more accurate OHLC data for the last few candles.
         #
-        # Steps (same as wedsoket_.py):
-        #   1. Fetch last 10 real candles from the API
-        #   2. Build candle_map from our existing candles
-        #   3. Replace synthetic candles (volume=0) with real API data
+        # Steps (same as wedsoket_.py:fill_gap_once + line 1701 comments):
+        #   1. Fetch 1-SECOND candles (period=1) for the last N seconds
+        #   2. Aggregate 1s candles into target timeframe using _aggregate_sub_minute
+        #   3. Replace synthetic candles (volume=0) with real aggregated data
         #   4. Run _fill_missing_slots on the merged result
+        #
+        # wedsoket_.py line 1701:
+        #   "1) fetch 1s candles -> aggregate to 1m (8-13 bridge candles, no gaps)"
         GAP_FILL_CANDLES = 10  # same as wedsoket_.py
         try:
-            # Fetch a small batch of recent candles (period=1s for maximum granularity)
+            # Fetch 1-SECOND candles for maximum granularity
+            # amount_of_seconds = 10 * period_seconds (e.g. 10 * 60 = 600s for M1)
+            # period = 1 (1-second candles, NOT the target timeframe!)
             gap_fill_seconds = GAP_FILL_CANDLES * period_seconds
-            elog.info(f"Fetching {GAP_FILL_CANDLES} recent real candles for gap-fill...")
-            real_candles = await asyncio.wait_for(
+            elog.info(f"Fetching 1-second candles for gap-fill "
+                      f"({gap_fill_seconds}s = ~{gap_fill_seconds} 1s candles)...")
+            raw_1s_candles = await asyncio.wait_for(
                 client.get_historical_candles(
                     asset,
                     amount_of_seconds=gap_fill_seconds,
-                    period=period_seconds,
-                    max_workers=1,  # small fetch, 1 worker is enough
+                    period=1,  # ← 1-SECOND candles! (was period_seconds)
+                    max_workers=1,
                     progress_callback=None,
                 ),
                 timeout=30,
             )
+
+            # Aggregate 1s candles into target timeframe
+            # (same as wedsoket_.py line 1701: "fetch 1s candles -> aggregate to 1m")
+            if raw_1s_candles and len(raw_1s_candles) > 0:
+                elog.info(f"Received {len(raw_1s_candles)} 1-second candles, "
+                          f"aggregating to M{timeframe_min}...")
+                real_candles = _aggregate_sub_minute(raw_1s_candles, period_seconds)
+                elog.info(f"Aggregated to {len(real_candles)} {timeframe_min}m candles")
+            else:
+                elog.warn(f"Gap-fill: no 1s candles returned — using flat fill only")
+                real_candles = []
 
             if real_candles:
                 # Build candle_map from existing candles
