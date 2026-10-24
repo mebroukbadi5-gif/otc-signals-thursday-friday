@@ -1132,8 +1132,11 @@ class Quotex:
 CREDENTIALS_FILE = Path("credentials.json")
 
 # مجلد حفظ الشموع — ملفات JSON تُحفظ مباشرة هنا بدون مجلدات فرعية.
-CANDLES_DIR = Path("candles_otc_data")
-CANDLES_DIR.mkdir(exist_ok=True)
+# Each run creates a subfolder with timestamp so you can inspect the candles
+# and verify gap-filling quality by opening the JSON files.
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+CANDLES_DIR = Path("candles_otc_data") / RUN_TIMESTAMP
+CANDLES_DIR.mkdir(parents=True, exist_ok=True)
 
 # قائمة العملات الـ13 (OTC) — تُجلب تلقائياً عند اختيار الخيار 2 بعد تسجيل الدخول.
 OTC_ASSETS = [
@@ -1314,6 +1317,51 @@ def pretty_asset(symbol: str, timeframe_min: int) -> str:
 # ==============================================================================
 # SECTION 11: JSON FILE SAVING (منسّق: شمعة واحدة في كل سطر)
 # ==============================================================================
+def _save_debug_json(candles: List[Dict], asset: str, timeframe_min: int, tag: str) -> None:
+    """Save a debug snapshot of candles for gap-fill inspection.
+
+    Creates a file like: candles_otc_data/<run>/<asset>_<tf>m_<tag>.json
+    This lets you open the file and compare candles before/after gap-filling.
+    """
+    if not candles:
+        return
+    try:
+        debug_path = CANDLES_DIR / f"{asset}_{timeframe_min}m_{tag}.json"
+        def fmt_dt(ts: int) -> str:
+            return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
+        for c in candles:
+            row = {
+                "datetime": fmt_dt(c['time']),
+                "time": c['time'],
+                "open": c['open'],
+                "high": c['high'],
+                "low": c['low'],
+                "close": c['close'],
+                "volume": c.get('volume', 0),
+                "synthetic": c.get('volume', 1) == 0,
+            }
+            rows.append("    " + json.dumps(row, ensure_ascii=False))
+        body = ",\n".join(rows)
+        meta = {
+            "asset": asset,
+            "timeframe_minutes": timeframe_min,
+            "candle_count": len(candles),
+            "synthetic_count": sum(1 for c in candles if c.get('volume', 1) == 0),
+            "tag": tag,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        meta_txt = json.dumps(meta, indent=2, ensure_ascii=False).replace("\n", "\n  ")
+        with open(debug_path, 'w', encoding='utf-8') as f:
+            f.write('{\n')
+            f.write(f'  "metadata": {meta_txt},\n')
+            f.write('  "candles": [\n')
+            f.write(body + '\n')
+            f.write('  ]\n}\n')
+    except Exception:
+        pass
+
+
 def save_candles_to_json(candles: List[Dict], asset: str, timeframe_min: int, days: int) -> Optional[Path]:
     """يحفظ الشموع في ملف JSON منسّق باسم: {asset}_{timeframe}m_{days}d_{random}.json
 
@@ -3252,10 +3300,16 @@ class CandleFetcher:
                 candles = sorted(candle_map.values(), key=lambda x: x['time'])
                 elog.info(f"Gap-fill: replaced {replaced_count} synthetic + "
                           f"added {new_count} real candles")
+
+                # Save BEFORE gap-fill snapshot for inspection
+                _save_debug_json(candles, asset, timeframe_min, "before_flat_fill")
             else:
                 elog.warn(f"Gap-fill: no real candles returned — using flat fill only")
         except Exception as e:
             elog.warn(f"Gap-fill fetch failed: {e} — using flat fill only")
+
+        # Save BEFORE _fill_missing_slots snapshot for inspection
+        _save_debug_json(candles, asset, timeframe_min, "before_fill_missing")
 
         # Apply flat gap-filling for any remaining gaps
         before_fill = len(candles)
