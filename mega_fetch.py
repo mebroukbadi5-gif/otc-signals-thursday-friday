@@ -3191,13 +3191,96 @@ class CandleFetcher:
         elog.info(f"After dedup: {len(candles):,} unique candles "
                   f"({candles[0]['time']} → {candles[-1]['time']})")
 
-        # Apply gap-filling
+        # ============================================================
+        # GAP-FILL WITH REAL DATA (ported from wedsoket_.py:fill_gap_once)
+        # ============================================================
+        # Instead of just filling ALL gaps with flat candles (previous close),
+        # we first fetch a SMALL batch of REAL recent candles (GAP_FILL_CANDLES=10)
+        # and use them to REPLACE any synthetic (volume=0) candles in our data.
+        # This gives more accurate OHLC data for the last few candles.
+        #
+        # Steps (same as wedsoket_.py):
+        #   1. Fetch last 10 real candles from the API
+        #   2. Build candle_map from our existing candles
+        #   3. Replace synthetic candles (volume=0) with real API data
+        #   4. Run _fill_missing_slots on the merged result
+        GAP_FILL_CANDLES = 10  # same as wedsoket_.py
+        try:
+            # Fetch a small batch of recent candles (period=1s for maximum granularity)
+            gap_fill_seconds = GAP_FILL_CANDLES * period_seconds
+            elog.info(f"Fetching {GAP_FILL_CANDLES} recent real candles for gap-fill...")
+            real_candles = await asyncio.wait_for(
+                client.get_historical_candles(
+                    asset,
+                    amount_of_seconds=gap_fill_seconds,
+                    period=period_seconds,
+                    max_workers=1,  # small fetch, 1 worker is enough
+                    progress_callback=None,
+                ),
+                timeout=30,
+            )
+
+            if real_candles:
+                # Build candle_map from existing candles
+                candle_map: Dict[int, Dict] = {}
+                for c in candles:
+                    candle_map[c['time']] = c
+
+                # Replace synthetic candles with real data
+                current_period_start = (int(time.time()) // period_seconds) * period_seconds
+                replaced_count = 0
+                new_count = 0
+
+                for c in real_candles:
+                    if not isinstance(c, dict):
+                        continue
+                    try:
+                        ts = int(c.get("time", c.get("timestamp", 0)))
+                        aligned = (ts // period_seconds) * period_seconds
+                        o = float(c.get("open", 0))
+                        h = float(c.get("high", c.get("max", 0)))
+                        l = float(c.get("low", c.get("min", 0)))
+                        cl = float(c.get("close", 0))
+                        v = int(c.get("volume", 0) or 0)
+
+                        if o > 0 and h > 0 and l > 0 and cl > 0:
+                            existing = candle_map.get(aligned)
+                            if existing is None:
+                                # Missing candle — add with real data
+                                candle_map[aligned] = {
+                                    'time': aligned, 'open': o, 'high': h,
+                                    'low': l, 'close': cl, 'volume': v,
+                                }
+                                new_count += 1
+                            elif aligned >= current_period_start:
+                                # Current streaming candle — don't touch
+                                continue
+                            elif existing.get('volume', 1) == 0:
+                                # Synthetic candle (volume=0) — REPLACE with real data
+                                candle_map[aligned] = {
+                                    'time': aligned, 'open': o, 'high': h,
+                                    'low': l, 'close': cl, 'volume': v,
+                                }
+                                replaced_count += 1
+                    except Exception:
+                        continue
+
+                # Rebuild candles from the updated map
+                candles = sorted(candle_map.values(), key=lambda x: x['time'])
+                elog.info(f"Gap-fill: replaced {replaced_count} synthetic + "
+                          f"added {new_count} real candles")
+            else:
+                elog.warn(f"Gap-fill: no real candles returned — using flat fill only")
+        except Exception as e:
+            elog.warn(f"Gap-fill fetch failed: {e} — using flat fill only")
+
+        # Apply flat gap-filling for any remaining gaps
         before_fill = len(candles)
         candles = _fill_missing_slots(candles, period_seconds, max_gap=GAP_FILL_MAX_SLOTS)
         after_fill = len(candles)
         filled_count = after_fill - before_fill
         if filled_count > 0:
-            elog.warn(f"Filled {filled_count} gap slots with flat candles for {asset}.")
+            elog.warn(f"Filled {filled_count} remaining gaps with flat candles for {asset}.")
 
         # Truncate or pad to exactly target_count
         if len(candles) > target_count:
