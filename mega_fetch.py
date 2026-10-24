@@ -3677,7 +3677,9 @@ async def main_async():
                 profit = interceptor.get_profit(asset)
                 fp = save_candles_to_json(candles, asset, timeframe, TARGET_CANDLE_COUNT, profit)
                 if fp:
-                    elog.success(f"Saved {len(candles)} candles → {fp.name}")
+                    # Print FULL absolute path so the user can find the file
+                    abs_path = fp.resolve()
+                    elog.success(f"Saved {len(candles)} candles → {abs_path}")
                     successes += 1
                 else:
                     failures.append(asset)
