@@ -1886,10 +1886,13 @@ class MessageInterceptor:
         # max_profit_by_asset = HIGHEST value from any source
         # profit_history = list of all values from depth/change (for MODE)
         # instruments_profit_by_asset = payout from instruments/list (AUTHORITATIVE)
+        # instruments_locked = True once instruments/list provides data for an asset
+        #   Once locked, depth/change CANNOT overwrite the payout for that asset.
         self.profit_by_asset: Dict[str, int] = {}
         self.max_profit_by_asset: Dict[str, int] = {}
         self.profit_history: Dict[str, List[int]] = defaultdict(list)
         self.instruments_profit_by_asset: Dict[str, int] = {}
+        self.instruments_locked: Dict[str, bool] = {}
         self.enabled_by_asset: Dict[str, bool] = {}
         self.live_prices: Dict[str, float] = {}
         self.live_ticks_seen: Dict[str, int] = defaultdict(int)
@@ -2233,17 +2236,9 @@ class MessageInterceptor:
     def _handle_depth_change(self, data: Any) -> None:
         """Handle depth/change binary frame: payout % per asset.
 
-        Format: [["EURUSD_otc",95], ["USDARS_otc",92], ...]
-
-        The Quotex server sends FLUCTUATING values for the same asset:
-          - Some are the CALL payout (high, e.g. 89%)
-          - Some are the PUT payout (low, e.g. 11%)
-          - Some are transitional/garbage values
-
-        Strategy: keep ALL values in history, and use the MODE (most common
-        value) as the real payout. The mode is more stable than MAX because
-        it filters out one-off spikes and reflects the most frequently
-        observed value — which is the real payout.
+        If an asset is LOCKED (instruments/list already provided the real payout),
+        SKIP it — depth/change values are unreliable (alternating CALL/PUT).
+        Only update assets that have NOT been locked by instruments/list yet.
         """
         if not isinstance(data, list):
             return
@@ -2254,20 +2249,17 @@ class MessageInterceptor:
                 asset = item[0]
                 payout = item[1]
                 if isinstance(asset, str) and isinstance(payout, (int, float)):
-                    payout_int = int(payout)
+                    # SKIP if this asset is locked by instruments/list
+                    if self.instruments_locked.get(asset, False):
+                        continue
 
-                    # Track ALL values (including out-of-range) for mode calculation
+                    payout_int = int(payout)
                     self.profit_history[asset].append(payout_int)
                     if len(self.profit_history[asset]) > 30:
                         self.profit_history[asset] = self.profit_history[asset][-30:]
-
-                    # Save last value (for reference)
                     self.profit_by_asset[asset] = payout_int
-
-                    # Keep MAX (still useful as upper bound)
                     if payout_int > self.max_profit_by_asset.get(asset, 0):
                         self.max_profit_by_asset[asset] = payout_int
-
                     if asset not in self.enabled_by_asset:
                         self.enabled_by_asset[asset] = True
                     new_count += 1
@@ -2416,11 +2408,10 @@ class MessageInterceptor:
                             except Exception:
                                 p_int = 0
                         # Store in instruments_profit_by_asset (AUTHORITATIVE)
+                        # and LOCK it — depth/change cannot overwrite this value.
                         if p_int:
                             self.instruments_profit_by_asset[asset] = p_int
-                            # Also update max
-                            if p_int > self.max_profit_by_asset.get(asset, 0):
-                                self.max_profit_by_asset[asset] = p_int
+                            self.instruments_locked[asset] = True
                     if enabled is not None:
                         self.enabled_by_asset[asset] = enabled
 
@@ -2563,24 +2554,16 @@ class MessageInterceptor:
 
         Priority:
           1. instruments_profit_by_asset — from instruments/list binary frame
-             (AUTHORITATIVE — the REAL payout, item[5] in the array)
-          2. MODE of profit_history (from depth/change + orders/closed)
-          3. MAX as last fallback
+             (AUTHORITATIVE — locked, cannot be overwritten by depth/change)
+          2. profit_by_asset — last value from depth/change (for unlocked assets)
+          3. None if no data available
         """
-        # Priority 1: instruments/list (most reliable)
+        # Priority 1: instruments/list (locked, authoritative)
         if asset in self.instruments_profit_by_asset:
             return self.instruments_profit_by_asset[asset]
 
-        # Priority 2: MODE of history
-        history = self.profit_history.get(asset, [])
-        if history:
-            from collections import Counter
-            counter = Counter(history)
-            mode_value, _ = counter.most_common(1)[0]
-            return mode_value
-
-        # Priority 3: MAX
-        return self.max_profit_by_asset.get(asset)
+        # Priority 2: last depth/change value (for unlocked assets only)
+        return self.profit_by_asset.get(asset)
 
     def get_last_profit(self, asset: str) -> Optional[int]:
         """Return the LAST payout % seen (for debugging)."""
