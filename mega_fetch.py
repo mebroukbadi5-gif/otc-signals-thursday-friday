@@ -1910,6 +1910,72 @@ def _fill_missing_slots(candles: List[Dict], period_seconds: int,
     return out
 
 
+def _aggregate_1s_to_target(raw_ticks: List, target_period: int) -> List[Dict]:
+    """Aggregate 1-second tick data into target-period OHLC candles.
+
+    The Quotex server returns 1s data as either:
+      - Dicts: {"time": ts, "open": o, "high": h, "low": l, "close": c, ...}
+      - Arrays: [timestamp, price, direction]  (tick data — NOT OHLC!)
+      - Arrays: [timestamp, open, close, high, low]  (OHLC without keys)
+
+    This function handles ALL formats and aggregates them into target_period
+    candles (e.g. 60s for M1).
+
+    Ported from wedsoket_.py:_aggregate_sub_minute + calculate_candles.
+    """
+    if not raw_ticks or target_period <= 1:
+        return []
+
+    # Step 1: Normalize all ticks to (timestamp, price) pairs
+    prices_at_time = []  # list of (aligned_ts, price)
+    for item in raw_ticks:
+        if isinstance(item, dict):
+            ts = int(item.get("time", item.get("timestamp", 0)))
+            # If it already has OHLC, use close as the price
+            price = float(item.get("close", item.get("price", 0)) or 0)
+            if ts > 0 and price > 0:
+                prices_at_time.append((ts, price))
+        elif isinstance(item, list) and len(item) >= 2:
+            try:
+                ts = int(item[0])
+                price = float(item[1])
+                if ts > 0 and price > 0:
+                    prices_at_time.append((ts, price))
+            except (ValueError, TypeError):
+                continue
+
+    if not prices_at_time:
+        return []
+
+    # Step 2: Group prices by target_period bucket
+    buckets = OrderedDict()
+    for ts, price in prices_at_time:
+        bucket_time = (ts // target_period) * target_period
+        if bucket_time not in buckets:
+            buckets[bucket_time] = []
+        buckets[bucket_time].append(price)
+
+    # Step 3: Build OHLC candles from each bucket
+    result = []
+    for bucket_time, prices in buckets.items():
+        if not prices:
+            continue
+        o = prices[0]
+        h = max(prices)
+        l = min(prices)
+        cl = prices[-1]
+        result.append({
+            'time': bucket_time,
+            'open': o,
+            'high': h,
+            'low': l,
+            'close': cl,
+            'volume': len(prices),
+        })
+
+    return sorted(result, key=lambda x: x['time'])
+
+
 # ============================================================================
 # SECTION 8: MESSAGE INTERCEPTOR (instruments + candles + live ticks)
 # ============================================================================
@@ -3259,7 +3325,7 @@ class CandleFetcher:
             if raw_1s_candles and len(raw_1s_candles) > 0:
                 elog.info(f"Received {len(raw_1s_candles)} 1-second candles, "
                           f"aggregating to M{timeframe_min}...")
-                real_candles = _aggregate_sub_minute(raw_1s_candles, period_seconds)
+                real_candles = _aggregate_1s_to_target(raw_1s_candles, period_seconds)
                 elog.info(f"Aggregated to {len(real_candles)} {timeframe_min}m candles")
             else:
                 elog.warn(f"Gap-fill: no 1s candles returned — using flat fill only")
